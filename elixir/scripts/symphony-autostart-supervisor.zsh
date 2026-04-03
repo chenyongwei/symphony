@@ -24,44 +24,62 @@ discover_workflows() {
 }
 
 refresh_port_map() {
-  local workflow port next_port tmp_map
-  local -A existing_ports
-  local -A assigned_ports
-  local -a workflows
+  python3 - "$CODE_ROOT" "$PORT_MAP_PATH" "$BASE_PORT" <<'PY'
+from pathlib import Path
+import os
+import sys
 
-  existing_ports=()
-  assigned_ports=()
-  workflows=("${(@f)$(discover_workflows)}")
-  tmp_map="${PORT_MAP_PATH}.tmp"
+code_root = Path(sys.argv[1]).expanduser()
+port_map_path = Path(sys.argv[2]).expanduser()
+base_port = int(sys.argv[3])
+tmp_map_path = Path(f"{port_map_path}.tmp")
 
-  if [[ -f "$PORT_MAP_PATH" ]]; then
-    while IFS=$'\t' read -r workflow port; do
-      [[ -n "$workflow" && -n "$port" ]] || continue
-      existing_ports["$workflow"]="$port"
-    done < "$PORT_MAP_PATH"
-  fi
+excluded_dir_names = {"archive", "node_modules", ".git"}
 
-  : > "$tmp_map"
-  next_port=$BASE_PORT
+workflows = []
+for root, dirs, files in os.walk(code_root):
+    dirs[:] = [
+        d for d in dirs
+        if d not in excluded_dir_names and not d.endswith("-symphony-workspaces")
+    ]
+    if Path(root).name != ".symphony":
+        continue
+    for name in files:
+        if name.startswith("WORKFLOW") and name.endswith(".md"):
+            workflows.append(str(Path(root, name)))
 
-  for workflow in "${workflows[@]}"; do
-    port="${existing_ports[$workflow]-}"
+workflows.sort()
+workflow_set = set(workflows)
+existing_ports = {}
+assigned_ports = {}
 
-    if [[ -n "$port" && -z "${assigned_ports[$port]-}" ]]; then
-      assigned_ports["$port"]="$workflow"
-    else
-      while [[ -n "${assigned_ports[$next_port]-}" ]]; do
-        (( next_port++ ))
-      done
-      port="$next_port"
-      assigned_ports["$port"]="$workflow"
-      (( next_port++ ))
-    fi
+if port_map_path.exists():
+    for raw in port_map_path.read_text().splitlines():
+        if "\t" not in raw:
+            continue
+        workflow, port = raw.split("\t", 1)
+        if workflow not in workflow_set:
+            continue
+        if port in assigned_ports:
+            continue
+        existing_ports[workflow] = port
+        assigned_ports[port] = workflow
 
-    printf '%s\t%s\n' "$workflow" "$port" >> "$tmp_map"
-  done
+next_port = base_port
+lines = []
+for workflow in workflows:
+    port = existing_ports.get(workflow)
+    if not port:
+        while str(next_port) in assigned_ports:
+            next_port += 1
+        port = str(next_port)
+        assigned_ports[port] = workflow
+        next_port += 1
+    lines.append(f"{workflow}\t{port}")
 
-  /bin/mv "$tmp_map" "$PORT_MAP_PATH"
+tmp_map_path.write_text("\n".join(lines) + ("\n" if lines else ""))
+tmp_map_path.replace(port_map_path)
+PY
 }
 
 is_workflow_running() {
@@ -86,7 +104,7 @@ ensure_instance_running() {
 }
 
 main_loop() {
-  local workflow port slug
+  local workflow port slug line
 
   log "symphony autostart supervisor is running"
 
@@ -94,7 +112,11 @@ main_loop() {
     refresh_port_map
 
     if [[ -f "$PORT_MAP_PATH" ]]; then
-      while IFS=$'\t' read -r workflow port; do
+      while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        [[ "$line" == *$'\t'* ]] || continue
+        workflow="$(printf '%s\n' "$line" | cut -f1)"
+        port="$(printf '%s\n' "$line" | cut -f2)"
         [[ -n "$workflow" && -n "$port" ]] || continue
         slug="${workflow:h:h:t}"
         ensure_instance_running "$workflow" "$port" "$slug"

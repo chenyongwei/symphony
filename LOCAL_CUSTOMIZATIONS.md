@@ -55,13 +55,17 @@ Current behavior:
 
 1. Symphony picks up the Linear issue.
 2. Codex writes the plan into the Linear workpad.
-3. The issue moves to `In Review` and pauses.
+3. The issue moves to `Plan Review` and pauses.
 4. A human reviews or edits the plan.
 5. A human approves the plan by adding a Linear comment such as `approve plan`, `plan approved`, `批准计划`, or `继续开发`.
 6. The issue is moved back to `In Progress`.
 7. Codex resumes implementation.
 
 This gate is implemented through the `Plan Review Gate` section in each custom workflow.
+
+To make comment-based approval actually observable by Symphony, the custom workflows also treat
+`Plan Review` / `Code Review` as active polling states. This lets an instance wake back up, see the
+human approval comment, flip the gate to `approved-for-implementation`, and continue execution.
 
 ## 5. Git and PR policy
 
@@ -77,8 +81,8 @@ Rules added:
 
 The review semantics were also clarified:
 
-- `In Review` without a PR means plan review
-- `In Review` with a PR means final code review
+- `Plan Review` means plan review
+- `Code Review` means final code review
 
 ## 6. Project-specific workspace behavior
 
@@ -93,6 +97,7 @@ The `nest-core` workflow treats the repo as a single Rust repo and prefers local
 - `./scripts/build.sh`
 - `cargo build`
 - `cargo test`
+- `feature/*` pull requests targeting `dev`
 
 Unlike the other two repos, `nest-core` now runs its spawned Codex sessions with:
 
