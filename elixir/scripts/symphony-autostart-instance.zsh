@@ -5,6 +5,7 @@ set -euo pipefail
 WORKFLOW_PATH="${1:-${SYMPHONY_WORKFLOW:-}}"
 SYMPHONY_PORT="${2:-${SYMPHONY_PORT:-}}"
 SYMPHONY_ELIXIR_DIR="${SYMPHONY_ELIXIR_DIR:-$HOME/Code/symphony/elixir}"
+BUILD_HELPER="${BUILD_HELPER:-$SYMPHONY_ELIXIR_DIR/scripts/ensure-symphony-built.sh}"
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
@@ -39,6 +40,11 @@ if ! command -v mise >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ ! -x "$BUILD_HELPER" ]]; then
+  echo "[symphony-instance] error: missing executable build helper: $BUILD_HELPER" >&2
+  exit 1
+fi
+
 if [[ -z "${LINEAR_API_KEY:-}" ]]; then
   echo "[symphony-instance] error: LINEAR_API_KEY is not set" >&2
   echo "[symphony-instance] hint: ensure it exists in ~/.zshrc before using autostart" >&2
@@ -46,6 +52,7 @@ if [[ -z "${LINEAR_API_KEY:-}" ]]; then
 fi
 
 cd "$SYMPHONY_ELIXIR_DIR"
+"$BUILD_HELPER" "$SYMPHONY_ELIXIR_DIR"
 
 echo "[symphony-instance] workflow: $WORKFLOW_PATH"
 echo "[symphony-instance] web UI: http://127.0.0.1:$SYMPHONY_PORT"

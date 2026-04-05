@@ -786,6 +786,39 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "attempt=3"
   end
 
+  test "config maps Linear priority to codex reasoning effort and defaults unset priority to high" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_command: "codex --config model_reasoning_effort={{ codex.reasoning_effort }} --model gpt-5.4 app-server"
+    )
+
+    urgent_issue = %Issue{identifier: "MT-901", priority: 1}
+    high_issue = %Issue{identifier: "MT-902", priority: 2}
+    medium_issue = %Issue{identifier: "MT-903", priority: 3}
+    low_issue = %Issue{identifier: "MT-904", priority: 4}
+    unset_issue = %Issue{identifier: "MT-905", priority: nil}
+
+    assert Config.reasoning_effort_for_issue(urgent_issue) == "xhigh"
+    assert Config.reasoning_effort_for_issue(high_issue) == "high"
+    assert Config.reasoning_effort_for_issue(medium_issue) == "medium"
+    assert Config.reasoning_effort_for_issue(low_issue) == "low"
+    assert Config.reasoning_effort_for_issue(unset_issue) == "high"
+
+    assert Config.render_codex_command(urgent_issue) =~ "model_reasoning_effort=xhigh"
+    assert Config.render_codex_command(high_issue) =~ "model_reasoning_effort=high"
+    assert Config.render_codex_command(medium_issue) =~ "model_reasoning_effort=medium"
+    assert Config.render_codex_command(low_issue) =~ "model_reasoning_effort=low"
+    assert Config.render_codex_command(unset_issue) =~ "model_reasoning_effort=high"
+  end
+
+  test "config leaves static codex commands unchanged when no issue context is provided" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_command: "/usr/local/bin/codex --config service_tier=fast --model gpt-5.4 app-server"
+    )
+
+    assert Config.render_codex_command() ==
+             "/usr/local/bin/codex --config service_tier=fast --model gpt-5.4 app-server"
+  end
+
   test "prompt builder renders issue datetime fields without crashing" do
     workflow_prompt = "Ticket {{ issue.identifier }} created={{ issue.created_at }} updated={{ issue.updated_at }}"
 

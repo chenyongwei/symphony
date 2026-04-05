@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Config do
   """
 
   alias SymphonyElixir.Config.Schema
-  alias SymphonyElixir.Workflow
+  alias SymphonyElixir.{TemplateRenderer, Workflow}
 
   @default_prompt_template """
   You are working on a Linear issue.
@@ -25,6 +25,8 @@ defmodule SymphonyElixir.Config do
           thread_sandbox: String.t(),
           turn_sandbox_policy: map()
         }
+
+  @type issue_like :: %{optional(atom() | String.t()) => term()} | struct() | nil
 
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
   def settings do
@@ -83,6 +85,25 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @spec render_codex_command(issue_like()) :: String.t()
+  def render_codex_command(issue \\ nil) do
+    command = settings!().codex.command
+
+    case issue do
+      nil ->
+        command
+
+      _ ->
+        TemplateRenderer.render!(
+          command,
+          %{
+            "codex" => %{"reasoning_effort" => reasoning_effort_for_issue(issue)},
+            "issue" => issue
+          }
+        )
+    end
+  end
+
   @spec server_port() :: non_neg_integer() | nil
   def server_port do
     case Application.get_env(:symphony_elixir, :server_port_override) do
@@ -133,6 +154,17 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @spec reasoning_effort_for_issue(issue_like()) :: String.t()
+  def reasoning_effort_for_issue(issue) do
+    case issue_priority(issue) do
+      1 -> "xhigh"
+      2 -> "high"
+      3 -> "medium"
+      4 -> "low"
+      _ -> "high"
+    end
+  end
+
   defp format_config_error(reason) do
     case reason do
       {:invalid_workflow_config, message} ->
@@ -151,4 +183,12 @@ defmodule SymphonyElixir.Config do
         "Invalid WORKFLOW.md config: #{inspect(other)}"
     end
   end
+
+  defp issue_priority(%_{} = issue), do: issue |> Map.from_struct() |> issue_priority()
+  defp issue_priority(%{"priority" => priority}), do: normalize_priority(priority)
+  defp issue_priority(%{priority: priority}), do: normalize_priority(priority)
+  defp issue_priority(_issue), do: nil
+
+  defp normalize_priority(priority) when is_integer(priority), do: priority
+  defp normalize_priority(_priority), do: nil
 end

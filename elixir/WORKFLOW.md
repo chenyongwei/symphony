@@ -61,6 +61,17 @@ Description:
 No description provided.
 {% endif %}
 
+## Algorithmic task signal mapping (canonical)
+
+- Treat a ticket as algorithmic when **any** of the following is true:
+  - title/description/comments contains one of: `排样`, `排序`, `packing`, `benchmark`, `布局优化`, `layout 优化`, `nesting`, `排样结果`.
+  - labels or title include `算法`, `algorithmic`, `optimization`, `layout`, `nest`, `packing`, or `benchmark`.
+  - ticket asks to compare optimization quality, routing order, or packing results before/after.
+- For all tickets where this matching rule triggers:
+  - run a pre/post result comparison pass,
+  - collect and upload `前后算法结果对比数据`,
+  - upload `前后算法对比e2e截图证据`.
+
 Instructions:
 
 1. This is an unattended orchestration session. Never ask a human to perform follow-up actions.
@@ -187,6 +198,10 @@ Use this only when completion is blocked by missing required tools or missing au
 
 - GitHub is **not** a valid blocker by default. Always try fallback strategies first (alternate remote/auth mode, then continue publish/review flow).
 - Do not move to `Human Review` for GitHub access/auth until all fallback strategies have been attempted and documented in the workpad.
+- Missing local validation/runtime environment is **not** a valid blocker by default. Treat missing package managers, language runtimes, dependency directories, browser runtimes, or repo bootstrap steps as execution work to complete in-session first.
+- Before declaring any non-GitHub tool blocker, inspect the repository and task context for the intended bootstrap path (`README`, task-provided validation commands, package manifests, version files, `mise`/`asdf`/`nvm` config, `mix.exs`, Playwright config, Dockerfiles, local scripts).
+- Install and configure the minimum local prerequisites needed to run the required validation, then retry the intended validation command before considering any fallback command.
+- Only escalate a missing-tool blocker when the remaining gap truly cannot be resolved in-session (for example: missing external auth, unavailable system package manager, unavailable sudo/root capability, unreachable shared service, or a required commercial/native dependency with no local install path).
 - If a non-GitHub required tool is missing, or required non-GitHub auth is unavailable, move the ticket to `Human Review` with a short blocker brief in the workpad that includes:
   - what is missing,
   - why it blocks required acceptance/validation,
@@ -208,11 +223,16 @@ Use this only when completion is blocked by missing required tools or missing au
     - For tickets that started as `Todo` with an attached PR, run the full PR feedback sweep protocol immediately after kickoff and before new feature work.
 5.  Run validation/tests required for the scope.
     - Mandatory gate: execute all ticket-provided `Validation`/`Test Plan`/ `Testing` requirements when present; treat unmet items as incomplete work.
+    - If the required validation cannot start because the local environment is incomplete, bootstrap the missing environment first (install/configure the needed runtime, package manager, dependencies, browser/runtime assets, or repo-local tools), then rerun the intended validation command.
+    - Prefer satisfying the exact ticket-provided validation command after bootstrap. Only use a narrower equivalent fallback when the original command is impossible after exhausting reasonable bootstrap steps, and document why the fallback is equivalent.
     - Prefer a targeted proof that directly demonstrates the behavior you changed.
     - You may make temporary local proof edits to validate assumptions (for example: tweak a local build input for `make`, or hardcode a UI account / response path) when this increases confidence.
     - Revert every temporary proof edit before commit/push.
+    - Keep environment bootstrap changes out of the commit unless the ticket explicitly requires repo changes for bootstrap; prefer local installs/config only, and document what was installed/configured in the workpad.
     - Document these temporary proof steps and outcomes in the workpad `Validation`/`Notes` sections so reviewers can follow the evidence.
     - If app-touching, run `launch-app` validation and capture/upload media via `github-pr-media` before handoff.
+    - If any E2E step is required, do not run/open host-machine GUI browser; use Docker Playwright MCP for all browser interactions and screenshots.
+    - If the task is algorithmic (per canonical `Algorithmic task signal mapping`), run a pre/post result comparison pass, collect 前后算法结果对比数据, and attach `前后算法结果对比数据` plus `前后算法对比e2e截图证据` on Linear before handoff.
 6.  Re-check all acceptance criteria and close any gaps.
 7.  Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
 8.  Attach PR URL to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
@@ -222,7 +242,7 @@ Use this only when completion is blocked by missing required tools or missing au
     - Mark completed plan/acceptance/validation checklist items as checked.
     - Add final handoff notes (commit + validation summary) in the same workpad comment.
     - Do not include PR URL in the workpad comment; keep PR linkage on the issue via attachment/link fields.
-    - Add a short `### Confusions` section at the bottom when any part of task execution was unclear/confusing, with concise bullets.
+    - Add a short `### Confusions` section at the bottom only when some part of task execution remained unclear/confusing after reasonable repo inspection, environment bootstrap, and validation retry attempts, with concise bullets.
     - Do not post any additional completion summary comment.
 11. Before moving to `Human Review`, poll PR feedback and checks:
     - Read the PR `Manual QA Plan` comment (when present) and use it to sharpen UI/runtime test coverage for the current change.
@@ -268,6 +288,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - PR checks are green, branch is pushed, and PR is linked on the issue.
 - Required PR metadata is present (`symphony` label).
 - If app-touching, runtime validation/media requirements from `App runtime validation (required)` are complete.
+- If algorithmic, `前后算法结果对比数据` and `前后算法对比e2e截图证据` are complete and attached on Linear.
 
 ## Guardrails
 
@@ -323,4 +344,9 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 ### Confusions
 
 - <only include when something was confusing during execution>
+
+### Algorithm Evidence (if applicable)
+
+- [ ] 上传 `前后算法结果对比数据`（前后算法输出/指标对比）
+- [ ] 上传 `前后算法对比e2e截图证据`（执行前后截图对比）
 ````

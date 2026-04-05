@@ -27,7 +27,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
-    with {:ok, session} <- start_session(workspace, opts) do
+    with {:ok, session} <- start_session(workspace, Keyword.put(opts, :issue, issue)) do
       try do
         run_turn(session, prompt, issue, opts)
       after
@@ -38,10 +38,12 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
+    issue = Keyword.get(opts, :issue)
     worker_host = Keyword.get(opts, :worker_host)
+    command = Keyword.get_lazy(opts, :command, fn -> Config.render_codex_command(issue) end)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host) do
+         {:ok, port} <- start_port(expanded_workspace, worker_host, command) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
@@ -186,7 +188,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, nil) do
+  defp start_port(workspace, nil, command) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
@@ -199,7 +201,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             :binary,
             :exit_status,
             :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(Config.settings!().codex.command)],
+            args: [~c"-lc", String.to_charlist(command)],
             cd: String.to_charlist(workspace),
             line: @port_line_bytes
           ]
@@ -209,15 +211,15 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, worker_host) when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace)
+  defp start_port(workspace, worker_host, command) when is_binary(worker_host) do
+    remote_command = remote_launch_command(workspace, command)
     SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
   end
 
-  defp remote_launch_command(workspace) when is_binary(workspace) do
+  defp remote_launch_command(workspace, command) when is_binary(workspace) and is_binary(command) do
     [
       "cd #{shell_escape(workspace)}",
-      "exec #{Config.settings!().codex.command}"
+      "exec #{command}"
     ]
     |> Enum.join(" && ")
   end

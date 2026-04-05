@@ -4,12 +4,22 @@ set -euo pipefail
 
 SYMPHONY_ELIXIR_DIR="${SYMPHONY_ELIXIR_DIR:-$HOME/Code/symphony/elixir}"
 INSTANCE_LAUNCHER="${INSTANCE_LAUNCHER:-$SYMPHONY_ELIXIR_DIR/scripts/symphony-autostart-instance.zsh}"
+BUILD_HELPER="${BUILD_HELPER:-$SYMPHONY_ELIXIR_DIR/scripts/ensure-symphony-built.sh}"
+MERGE_WATCHER="${MERGE_WATCHER:-$SYMPHONY_ELIXIR_DIR/scripts/symphony-pr-merge-watcher.py}"
 CODE_ROOT="${CODE_ROOT:-$HOME/Code}"
 STATE_DIR="${SYMPHONY_STATE_DIR:-$HOME/Library/Application Support/Symphony}"
 LOG_DIR="${SYMPHONY_LOG_DIR:-$HOME/Library/Logs/Symphony}"
 PORT_MAP_PATH="${PORT_MAP_PATH:-$STATE_DIR/workflow_ports.tsv}"
 BASE_PORT="${SYMPHONY_BASE_PORT:-4000}"
-SCAN_INTERVAL="${SYMPHONY_SCAN_INTERVAL:-15}"
+SCAN_INTERVAL="${SYMPHONY_SCAN_INTERVAL:-30}"
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+if [[ -f "$HOME/.zshrc" ]]; then
+  set +u
+  source "$HOME/.zshrc" >/dev/null 2>&1 || true
+  set -u
+fi
 
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 
@@ -103,13 +113,30 @@ ensure_instance_running() {
     2>> "$LOG_DIR/${slug}.err.log" &
 }
 
+ensure_merge_watcher_running() {
+  if pgrep -f -- "$MERGE_WATCHER" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log "starting merge watcher"
+  "$MERGE_WATCHER" \
+    >> "$LOG_DIR/merge-watcher.out.log" \
+    2>> "$LOG_DIR/merge-watcher.err.log" &
+}
+
+ensure_symphony_built() {
+  "$BUILD_HELPER" "$SYMPHONY_ELIXIR_DIR" >> "$LOG_DIR/launchd.out.log" 2>> "$LOG_DIR/launchd.err.log"
+}
+
 main_loop() {
   local workflow port slug line
 
   log "symphony autostart supervisor is running"
 
   while true; do
+    ensure_symphony_built
     refresh_port_map
+    ensure_merge_watcher_running
 
     if [[ -f "$PORT_MAP_PATH" ]]; then
       while IFS= read -r line; do
@@ -134,6 +161,16 @@ fi
 
 if [[ ! -x "$INSTANCE_LAUNCHER" ]]; then
   echo "[symphony-supervisor] error: missing executable instance launcher: $INSTANCE_LAUNCHER" >&2
+  exit 1
+fi
+
+if [[ ! -x "$BUILD_HELPER" ]]; then
+  echo "[symphony-supervisor] error: missing executable build helper: $BUILD_HELPER" >&2
+  exit 1
+fi
+
+if [[ ! -x "$MERGE_WATCHER" ]]; then
+  echo "[symphony-supervisor] error: missing executable merge watcher: $MERGE_WATCHER" >&2
   exit 1
 fi
 

@@ -183,6 +183,92 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server renders codex command templates from issue priority before launch" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-rendered-command-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-1002")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-rendered-command.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-rendered-command.trace}"
+      count=0
+      printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1002"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1002"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} --reasoning {{ codex.reasoning_effort }} --model gpt-5.4 app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-rendered-command",
+        identifier: "MT-1002",
+        title: "Render codex command",
+        description: "Ensure priority drives reasoning effort",
+        priority: 3,
+        state: "Code Progress",
+        url: "https://example.org/issues/MT-1002",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Render codex command", issue)
+
+      trace = File.read!(trace_file)
+      lines = String.split(trace, "\n", trim: true)
+
+      assert argv_line = Enum.find(lines, &String.starts_with?(&1, "ARGV:"))
+      assert argv_line =~ "--reasoning medium --model gpt-5.4 app-server"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server marks request-for-input events as a hard failure" do
     test_root =
       Path.join(
