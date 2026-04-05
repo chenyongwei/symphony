@@ -203,6 +203,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - Missing local validation/runtime environment is **not** a valid blocker by default. Treat missing package managers, language runtimes, dependency directories, browser runtimes, or repo bootstrap steps as execution work to complete in-session first.
 - Before declaring any non-GitHub tool blocker, inspect the repository and task context for the intended bootstrap path (`README`, task-provided validation commands, package manifests, version files, `mise`/`asdf`/`nvm` config, `mix.exs`, Playwright config, Dockerfiles, local scripts).
 - Install and configure the minimum local prerequisites needed to run the required validation, then retry the intended validation command before considering any fallback command.
+- For any required E2E validation, the default and required browser path is the local Docker-hosted Playwright MCP server. Look for and use that server before inventing any alternate browser path.
 - Only escalate a missing-tool blocker when the remaining gap truly cannot be resolved in-session (for example: missing external auth, unavailable system package manager, unavailable sudo/root capability, unreachable shared service, or a required commercial/native dependency with no local install path).
 - If a non-GitHub required tool is missing, or required non-GitHub auth is unavailable, move the ticket to `Human Review` with a short blocker brief in the workpad that includes:
   - what is missing,
@@ -233,7 +234,9 @@ Use this only when completion is blocked by missing required tools or missing au
     - Keep environment bootstrap changes out of the commit unless the ticket explicitly requires repo changes for bootstrap; prefer local installs/config only, and document what was installed/configured in the workpad.
     - Document these temporary proof steps and outcomes in the workpad `Validation`/`Notes` sections so reviewers can follow the evidence.
     - If app-touching, run `launch-app` validation and capture/upload media via `github-pr-media` before handoff.
-    - If any E2E step is required, do not run/open host-machine GUI browser; use Docker Playwright MCP for all browser interactions and screenshots.
+    - If any E2E step is required, do not run/open host-machine GUI browser; use the local Docker Playwright MCP server for all browser interactions and screenshots.
+    - Treat the local Docker Playwright MCP server as mandatory for E2E unless the task explicitly says otherwise.
+    - If the local Docker Playwright MCP server is not available or cannot be found, record that fact in the Linear workpad comment immediately with a short reminder to the user, then continue only with non-E2E validation that is still possible.
     - When screenshots are required for validation or evidence, upload them as needed but present them in the Linear workpad comment as embedded images, not bare URLs.
     - If the task is algorithmic (per canonical `Algorithmic task signal mapping`), run a pre/post result comparison pass, collect 前后算法结果对比数据, and attach `前后算法结果对比数据` plus `前后算法对比e2e截图证据` on Linear before handoff.
 6.  Re-check all acceptance criteria and close any gaps.
