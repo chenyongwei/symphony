@@ -93,6 +93,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - Keep ticket metadata current (state, checklist, acceptance criteria, links).
 - Treat a single persistent Linear comment as the source of truth for progress.
 - Use that single workpad comment for all progress and handoff notes; do not post separate "done"/summary comments.
+- When test evidence includes screenshots, embed the screenshots directly in the Linear workpad comment with Markdown image syntax; do not submit screenshot evidence as plain links only.
 - PR titles must begin with the issue key. Use the format `{{ issue.identifier }}: <concise summary>` so cross-tool issue linking stays reliable.
 - Treat any ticket-authored `Validation`, `Test Plan`, or `Testing` section as non-negotiable acceptance input: mirror it in the workpad and execute it before considering the work complete.
 - When meaningful out-of-scope improvements are discovered during execution,
@@ -233,6 +234,7 @@ Use this only when completion is blocked by missing required tools or missing au
     - Document these temporary proof steps and outcomes in the workpad `Validation`/`Notes` sections so reviewers can follow the evidence.
     - If app-touching, run `launch-app` validation and capture/upload media via `github-pr-media` before handoff.
     - If any E2E step is required, do not run/open host-machine GUI browser; use Docker Playwright MCP for all browser interactions and screenshots.
+    - When screenshots are required for validation or evidence, upload them as needed but present them in the Linear workpad comment as embedded images, not bare URLs.
     - If the task is algorithmic (per canonical `Algorithmic task signal mapping`), run a pre/post result comparison pass, collect 前后算法结果对比数据, and attach `前后算法结果对比数据` plus `前后算法对比e2e截图证据` on Linear before handoff.
 6.  Re-check all acceptance criteria and close any gaps.
 7.  Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
