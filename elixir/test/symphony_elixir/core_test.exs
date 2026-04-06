@@ -563,6 +563,7 @@ defmodule SymphonyElixir.CoreTest do
 
       refute Map.has_key?(state.running, issue_id)
       assert MapSet.member?(state.completed, issue_id)
+      refute MapSet.member?(state.claimed, issue_id)
       assert state.retry_attempts == %{}
     after
       restore_app_env(:memory_tracker_issues, previous_memory_issues)
