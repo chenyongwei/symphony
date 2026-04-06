@@ -48,8 +48,8 @@ EOF
 plutil -lint "$PLIST_PATH" >/dev/null
 
 launchctl bootout "gui/$(id -u)" "$PLIST_PATH" >/dev/null 2>&1 || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
 launchctl enable "gui/$(id -u)/${LABEL}" >/dev/null 2>&1 || true
+launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
 launchctl kickstart -k "gui/$(id -u)/${LABEL}"
 
 echo "[install] installed ${PLIST_PATH}"
