@@ -17,6 +17,7 @@ description:
 - Push current branch changes to `origin` safely.
 - Create a PR if none exists for the branch, otherwise update the existing PR.
 - Keep branch history clean when remote has moved.
+- Explicitly target the repository's active integration branch when creating or editing a PR instead of relying on the GitHub default branch.
 
 ## Related Skills
 
@@ -31,7 +32,7 @@ description:
    remote URL is already configured.
 4. If push is not clean/rejected:
    - If the failure is a non-fast-forward or sync problem, run the `pull`
-     skill to merge `origin/main`, resolve conflicts, and rerun validation.
+     skill to merge the current integration branch, resolve conflicts, and rerun validation.
    - Push again; use `--force-with-lease` only when history was rewritten.
    - If the failure is due to auth, permissions, or workflow restrictions on
      the configured remote, stop and surface the exact error instead of
@@ -61,6 +62,32 @@ description:
 # Identify branch
 branch=$(git branch --show-current)
 
+# Resolve the integration branch that this feature branch should target.
+# Prefer the highest-priority remote integration branch already contained by HEAD.
+base_branch=""
+for candidate in dev main master; do
+  if git show-ref --verify --quiet "refs/remotes/origin/$candidate" &&
+     git merge-base --is-ancestor "refs/remotes/origin/$candidate" HEAD; then
+    base_branch="$candidate"
+    break
+  fi
+done
+
+# Fall back to the current upstream when available.
+if [ -z "$base_branch" ]; then
+  upstream_ref=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
+  case "$upstream_ref" in
+    origin/*)
+      base_branch="${upstream_ref#origin/}"
+      ;;
+  esac
+fi
+
+if [ -z "$base_branch" ]; then
+  echo "Unable to determine integration branch for PR base" >&2
+  exit 1
+fi
+
 # Minimal validation gate
 make -C elixir all
 
@@ -87,10 +114,10 @@ fi
 # Write a clear, human-friendly title that summarizes the shipped change.
 pr_title="<clear PR title written for this change>"
 if [ -z "$pr_state" ]; then
-  gh pr create --title "$pr_title"
+  gh pr create --base "$base_branch" --title "$pr_title"
 else
   # Reconsider title on every branch update; edit if scope shifted.
-  gh pr edit --title "$pr_title"
+  gh pr edit --base "$base_branch" --title "$pr_title"
 fi
 
 # Write/edit PR body to match .github/pull_request_template.md before validation.
@@ -111,6 +138,7 @@ gh pr view --json url -q .url
 ## Notes
 
 - Do not use `--force`; only use `--force-with-lease` as the last resort.
+- Never let `gh pr create` infer the base branch from the repository default branch when the workflow uses a different integration branch such as `dev`.
 - Distinguish sync problems from remote auth/permission problems:
   - Use the `pull` skill for non-fast-forward or stale-branch issues.
   - Surface auth, permissions, or workflow restrictions directly instead of

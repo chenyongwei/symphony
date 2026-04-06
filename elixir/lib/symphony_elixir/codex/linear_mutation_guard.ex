@@ -17,6 +17,7 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
           nodes {
             id
             name
+            position
             type
           }
         }
@@ -35,12 +36,31 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
         }
       }
     }
+  }
   """
 
-  @create_comment_mutation """
-  mutation SymphonyCreateComment($issueId: String!, $body: String!) {
-    commentCreate(input: {issueId: $issueId, body: $body}) {
+  @attach_github_pr_mutation """
+  mutation SymphonyAttachGitHubPR($issueId: String!, $url: String!, $title: String!) {
+    attachmentLinkGitHubPR(issueId: $issueId, url: $url, title: $title, linkKind: links) {
       success
+      attachment {
+        id
+        title
+        url
+      }
+    }
+  }
+  """
+
+  @attach_url_mutation """
+  mutation SymphonyAttachURL($issueId: String!, $url: String!, $title: String!) {
+    attachmentLinkURL(issueId: $issueId, url: $url, title: $title) {
+      success
+      attachment {
+        id
+        title
+        url
+      }
     }
   }
   """
@@ -65,7 +85,6 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
         }
       }
     }
-  }
   }
   """
 
@@ -551,6 +570,8 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
 
   defp ensure_pr_written_back(issue_context, pr_details, linear_client) do
     pr_url = Map.get(pr_details, "url")
+    issue_id = Map.fetch!(issue_context, "id")
+    pr_title = pr_link_title(pr_details)
 
     cond do
       not is_binary(pr_url) or pr_url == "" ->
@@ -560,19 +581,41 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
         :ok
 
       true ->
-        with {:ok, response} <-
-               linear_client.(
-                 @create_comment_mutation,
-                 %{issueId: Map.fetch!(issue_context, "id"), body: pr_link_comment(pr_url)},
-                 []
-               ),
-             true <- get_in(response, ["data", "commentCreate", "success"]) == true do
-          :ok
-        else
-          false -> {:error, :pull_request_writeback_failed}
+        case attach_pull_request_link(linear_client, issue_id, pr_url, pr_title) do
+          :ok -> :ok
           {:error, reason} -> {:error, {:pull_request_writeback_failed, reason}}
-          _ -> {:error, :pull_request_writeback_failed}
         end
+    end
+  end
+
+  defp attach_pull_request_link(linear_client, issue_id, pr_url, pr_title) do
+    variables = %{issueId: issue_id, url: pr_url, title: pr_title}
+
+    case run_attachment_mutation(linear_client, @attach_github_pr_mutation, "attachmentLinkGitHubPR", variables) do
+      :ok ->
+        :ok
+
+      {:error, github_reason} ->
+        case run_attachment_mutation(linear_client, @attach_url_mutation, "attachmentLinkURL", variables) do
+          :ok -> :ok
+          {:error, url_reason} -> {:error, %{github_pr: github_reason, url_attachment: url_reason}}
+        end
+    end
+  end
+
+  defp run_attachment_mutation(linear_client, mutation, response_key, variables) do
+    with {:ok, response} <- linear_client.(mutation, variables, []),
+         true <- get_in(response, ["data", response_key, "success"]) == true do
+      :ok
+    else
+      false ->
+        {:error, :unsuccessful_response}
+
+      {:ok, response} ->
+        {:error, response}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -677,7 +720,12 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
     end
   end
 
-  defp pr_link_comment(url), do: "Symphony PR link\n#{url}"
+  defp pr_link_title(pr_details) do
+    case Map.get(pr_details, "title") do
+      title when is_binary(title) and title != "" -> title
+      _ -> "Symphony PR link"
+    end
+  end
 
   defp parse_issue_update(query, variables) do
     case Regex.named_captures(~r/issueUpdate\s*\((?<args>.*?)\)\s*\{/s, query) do
@@ -944,7 +992,12 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
     issue_context
     |> get_in(["team", "states", "nodes"])
     |> List.wrap()
+    |> Enum.sort_by(&workflow_state_position/1)
   end
+
+  defp workflow_state_position(%{"position" => position}) when is_number(position), do: position
+  defp workflow_state_position(%{position: position}) when is_number(position), do: position
+  defp workflow_state_position(_state), do: :infinity
 
   defp active_state_name?(state_name) when is_binary(state_name) do
     Config.settings!().tracker.active_states

@@ -432,6 +432,56 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
            }
   end
 
+  test "linear_graphql uses workflow state position instead of raw node order" do
+    issue = %Issue{id: "issue-1", identifier: "MT-1", state: "Code Progress"}
+    workspace = workspace_with_pr_template!()
+
+    on_exit(fn -> File.rm_rf!(workspace) end)
+
+    shuffled_states = [
+      {"Code Review", "started", 40.0},
+      {"Done", "completed", 60.0},
+      {"Todo", "unstarted", 10.0},
+      {"Code Progress", "started", 30.0},
+      {"Plan Progress", "started", 20.0}
+    ]
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => issue_update_mutation(), "variables" => %{"issueId" => "issue-1", "stateId" => workflow_state_id("Code Review")}},
+        issue: issue,
+        workspace: workspace,
+        linear_client: fn query, _variables, _opts ->
+          if String.contains?(query, "SymphonyIssueGuardContext") do
+            {:ok, %{"data" => %{"issue" => workflow_issue_context("Code Progress", states: workflow_states(shuffled_states))}}}
+          else
+            flunk("original mutation should not run when no PR is open")
+          end
+        end,
+        command_runner: fn _workspace, _worker_host, command, args ->
+          case {command, args} do
+            {"git", ["branch", "--show-current"]} -> {:ok, "feature/MT-1\n"}
+            {"git", ["fetch", "origin", "dev"]} -> {:ok, ""}
+            {"git", ["status", "--porcelain", "--untracked-files=no"]} -> {:ok, ""}
+            {"git", ["ls-remote", "--heads", "origin", "feature/MT-1"]} -> {:ok, "abc123\trefs/heads/feature/MT-1\n"}
+            {"git", ["rev-parse", "HEAD"]} -> {:ok, "abc123\n"}
+            {"git", ["merge-base", "--is-ancestor", "refs/remotes/origin/dev", "HEAD"]} -> {:ok, ""}
+            {"gh", ["pr", "list", "--head", "feature/MT-1", "--state", "open", "--limit", "10", "--json", "number"]} -> {:ok, "[]"}
+            other -> flunk("unexpected command #{inspect(other)}")
+          end
+        end
+      )
+
+    assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "message" => "Symphony blocks final review handoff until the current `feature/*` branch has an open pull request."
+             }
+           }
+  end
+
   test "linear_graphql applies review handoff guards using ordered active states instead of fixed review names" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: ["Todo", "Doing"])
 
@@ -596,8 +646,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
             String.contains?(query, "SymphonyIssueGuardContext") ->
               {:ok, %{"data" => %{"issue" => workflow_issue_context("Code Progress")}}}
 
-            String.contains?(query, "commentCreate") ->
-              {:ok, %{"data" => %{"commentCreate" => %{"success" => true}}}}
+            String.contains?(query, "attachmentLinkGitHubPR") ->
+              {:ok, %{"data" => %{"attachmentLinkGitHubPR" => %{"success" => true}}}}
 
             String.contains?(query, "issueUpdate") ->
               {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
@@ -650,8 +700,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
             String.contains?(query, "SymphonyIssueGuardContext") ->
               {:ok, %{"data" => %{"issue" => workflow_issue_context("Code Progress")}}}
 
-            String.contains?(query, "commentCreate") ->
-              {:ok, %{"data" => %{"commentCreate" => %{"success" => true}}}}
+            String.contains?(query, "attachmentLinkGitHubPR") ->
+              {:ok, %{"data" => %{"attachmentLinkGitHubPR" => %{"success" => true}}}}
 
             String.contains?(query, "issueUpdate") ->
               {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
@@ -753,8 +803,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
             String.contains?(query, "SymphonyIssueGuardContext") ->
               {:ok, %{"data" => %{"issue" => workflow_issue_context("Code Progress")}}}
 
-            String.contains?(query, "commentCreate") ->
-              {:ok, %{"data" => %{"commentCreate" => %{"success" => true}}}}
+            String.contains?(query, "attachmentLinkGitHubPR") ->
+              {:ok, %{"data" => %{"attachmentLinkGitHubPR" => %{"success" => true}}}}
 
             String.contains?(query, "issueUpdate") ->
               {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
@@ -788,8 +838,9 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert Enum.any?(linear_calls, fn {query, variables, opts} ->
              opts == [] and issue_id_variable(variables) == "issue-1" and
-               body_variable(variables) == "Symphony PR link\nhttps://github.com/openai/symphony/pull/42" and
-               String.contains?(query, "commentCreate")
+               url_variable(variables) == "https://github.com/openai/symphony/pull/42" and
+               title_variable(variables) == "MT-1: Fix bug" and
+               String.contains?(query, "attachmentLinkGitHubPR")
            end)
 
     expected_state_id = workflow_state_id("Code Review")
@@ -1144,8 +1195,23 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
   end
 
   defp workflow_states(definitions) when is_list(definitions) do
-    Enum.map(definitions, fn {name, type} ->
-      %{"id" => workflow_state_id(name), "name" => name, "type" => type}
+    Enum.with_index(definitions, 1)
+    |> Enum.map(fn
+      {{name, type}, index} ->
+        %{
+          "id" => workflow_state_id(name),
+          "name" => name,
+          "position" => index * 10.0,
+          "type" => type
+        }
+
+      {{name, type, position}, _index} ->
+        %{
+          "id" => workflow_state_id(name),
+          "name" => name,
+          "position" => position,
+          "type" => type
+        }
     end)
   end
 
@@ -1355,8 +1421,12 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     Map.get(variables, "stateId") || Map.get(variables, :stateId)
   end
 
-  defp body_variable(variables) when is_map(variables) do
-    Map.get(variables, "body") || Map.get(variables, :body)
+  defp url_variable(variables) when is_map(variables) do
+    Map.get(variables, "url") || Map.get(variables, :url)
+  end
+
+  defp title_variable(variables) when is_map(variables) do
+    Map.get(variables, "title") || Map.get(variables, :title)
   end
 
   defp comment_node({comment, index}) when is_binary(comment) do
