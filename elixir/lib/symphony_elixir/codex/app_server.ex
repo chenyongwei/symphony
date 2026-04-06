@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
+  @halt_turn_port_drain_ms 50
 
   @type session :: %{
           port: port(),
@@ -77,7 +78,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           auto_approve_requests: auto_approve_requests,
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
-          workspace: workspace
+          workspace: workspace,
+          worker_host: worker_host
         },
         prompt,
         issue,
@@ -87,7 +89,11 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
-        DynamicTool.execute(tool, arguments)
+        DynamicTool.execute(tool, arguments,
+          issue: issue,
+          workspace: workspace,
+          worker_host: worker_host
+        )
       end)
 
     case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
@@ -488,6 +494,16 @@ defmodule SymphonyElixir.Codex.AppServer do
       :approved ->
         receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
 
+      {:halt_turn, halt_reason} ->
+        emit_message(
+          on_message,
+          :turn_halted,
+          %{payload: payload, raw: payload_string, reason: halt_reason},
+          metadata
+        )
+
+        {:ok, {:halted, halt_reason}}
+
       :approval_required ->
         emit_message(
           on_message,
@@ -579,7 +595,12 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     emit_message(on_message, event, %{payload: payload, raw: payload_string}, metadata)
 
-    :approved
+    if tool_halt_requested?(result) do
+      drain_port_after_tool_halt()
+      {:halt_turn, tool_halt_reason(result)}
+    else
+      :approved
+    end
   end
 
   defp maybe_handle_approval_request(
@@ -719,6 +740,16 @@ defmodule SymphonyElixir.Codex.AppServer do
         "text" => output
       }
     ]
+  end
+
+  defp tool_halt_requested?(%{"control" => %{"haltAfterTool" => true}}), do: true
+  defp tool_halt_requested?(_result), do: false
+
+  defp tool_halt_reason(%{"control" => %{"haltReason" => reason}}), do: reason
+  defp tool_halt_reason(_result), do: %{"type" => "tool_requested_halt"}
+
+  defp drain_port_after_tool_halt do
+    Process.sleep(@halt_turn_port_drain_ms)
   end
 
   defp approve_or_require(

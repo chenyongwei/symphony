@@ -1229,6 +1229,199 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.workflow_prompt() == workflow_prompt
   end
 
+  test "workspace sync fast-forwards a clean integration branch" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-sync-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      %{next_sha: next_sha, workspace_repo: workspace_repo} = create_sync_fixture!(test_root)
+
+      assert :ok = Workspace.sync_integration_branch(workspace_repo)
+      assert git_output!(workspace_repo, ["rev-parse", "HEAD"]) == next_sha
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "workspace sync is a no-op on feature branches" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-sync-feature-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      %{base_sha: base_sha, workspace_repo: workspace_repo} = create_sync_fixture!(test_root)
+
+      git!(workspace_repo, ["checkout", "-b", "feature/test-sync-noop"])
+
+      assert :ok = Workspace.sync_integration_branch(workspace_repo)
+      assert git_output!(workspace_repo, ["rev-parse", "HEAD"]) == base_sha
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "workspace sync refuses dirty integration branches" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-sync-dirty-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      %{base_sha: base_sha, workspace_repo: workspace_repo} = create_sync_fixture!(test_root)
+
+      File.write!(Path.join(workspace_repo, "README.md"), "dirty\n")
+
+      assert {:error, {:workspace_sync_failed, 20, output}} =
+               Workspace.sync_integration_branch(workspace_repo)
+
+      assert output =~ "refusing to sync dirty integration branch"
+      assert git_output!(workspace_repo, ["rev-parse", "HEAD"]) == base_sha
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "workspace issue branch setup creates the issue feature branch from origin/dev" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-issue-branch-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      %{next_sha: next_sha, workspace_repo: workspace_repo} = create_sync_fixture!(test_root)
+
+      assert :ok = Workspace.sync_integration_branch(workspace_repo)
+      assert :ok = Workspace.ensure_issue_feature_branch(workspace_repo, "MT-BRANCH")
+      assert git_output!(workspace_repo, ["branch", "--show-current"]) == "feature/MT-BRANCH"
+      assert git_output!(workspace_repo, ["rev-parse", "HEAD"]) == next_sha
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "workspace issue branch setup refuses switching away from a dirty non-issue branch" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-issue-branch-dirty-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      %{workspace_repo: workspace_repo} = create_sync_fixture!(test_root)
+
+      git!(workspace_repo, ["checkout", "-b", "feature/other-issue"])
+      File.write!(Path.join(workspace_repo, "README.md"), "dirty\n")
+
+      assert {:error, {:workspace_issue_branch_failed, 21, output}} =
+               Workspace.ensure_issue_feature_branch(workspace_repo, "MT-BRANCH")
+
+      assert output =~ "refusing to switch branches"
+      assert git_output!(workspace_repo, ["branch", "--show-current"]) == "feature/other-issue"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner syncs integration branch and switches to the issue feature branch before before_run hook" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-sync-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      %{base_sha: base_sha, next_sha: next_sha, remote_repo: remote_repo} =
+        create_sync_fixture!(test_root)
+
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-sync"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-sync"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: """
+        git clone #{remote_repo} .
+        git checkout dev
+        git reset --hard #{base_sha}
+        """,
+        hook_before_run: """
+        git rev-parse HEAD > .symphony-sync-head
+        git branch --show-current > .symphony-sync-branch
+        """,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-sync-order",
+        identifier: "MT-SYNC",
+        title: "Sync before before_run",
+        description: "Ensure startup sync happens first",
+        state: "Todo",
+        url: "https://example.org/issues/MT-SYNC",
+        labels: []
+      }
+
+      assert :ok =
+               AgentRunner.run(
+                 issue,
+                 nil,
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+               )
+
+      synced_head =
+        workspace_root
+        |> Path.join("MT-SYNC")
+        |> Path.join(".symphony-sync-head")
+        |> File.read!()
+        |> String.trim()
+
+      assert synced_head == next_sha
+      refute synced_head == base_sha
+
+      synced_branch =
+        workspace_root
+        |> Path.join("MT-SYNC")
+        |> Path.join(".symphony-sync-branch")
+        |> File.read!()
+        |> String.trim()
+
+      assert synced_branch == "feature/MT-SYNC"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "remote workspace lifecycle uses ssh host aliases from worker config" do
     test_root =
       Path.join(
@@ -1281,6 +1474,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert Config.settings!().worker.ssh_hosts == ["worker-01:2200"]
       assert Config.settings!().workspace.root == workspace_root
       assert {:ok, ^workspace_path} = Workspace.create_for_issue("MT-SSH-WS", "worker-01:2200")
+      assert :ok = Workspace.sync_integration_branch(workspace_path, "worker-01:2200")
+      assert :ok = Workspace.ensure_issue_feature_branch(workspace_path, "MT-SSH-WS", "worker-01:2200")
       assert :ok = Workspace.run_before_run_hook(workspace_path, "MT-SSH-WS", "worker-01:2200")
       assert :ok = Workspace.run_after_run_hook(workspace_path, "MT-SSH-WS", "worker-01:2200")
       assert :ok = Workspace.remove_issue_workspaces("MT-SSH-WS", "worker-01:2200")
@@ -1290,6 +1485,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert trace =~ "__SYMPHONY_WORKSPACE__"
       assert trace =~ "~/.symphony-remote-workspaces/MT-SSH-WS"
       assert trace =~ "${workspace#~/}"
+      assert trace =~ "git fetch origin \"$current_branch\""
+      assert trace =~ "git merge --ff-only \"origin/$current_branch\""
+      assert trace =~ "git checkout -B \"$issue_branch\" \"origin/dev\""
       assert trace =~ "echo before-run"
       assert trace =~ "echo after-run"
       assert trace =~ "echo before-remove"
@@ -1297,6 +1495,66 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert trace =~ workspace_path
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  defp create_sync_fixture!(test_root) do
+    seed_repo = Path.join(test_root, "seed")
+    remote_repo = Path.join(test_root, "remote.git")
+    workspace_repo = Path.join(test_root, "workspace")
+
+    File.mkdir_p!(seed_repo)
+
+    git!(seed_repo, ["init", "-b", "dev"])
+    git!(seed_repo, ["config", "user.name", "Test User"])
+    git!(seed_repo, ["config", "user.email", "test@example.com"])
+
+    File.write!(Path.join(seed_repo, "README.md"), "one\n")
+    git!(seed_repo, ["add", "README.md"])
+    git!(seed_repo, ["commit", "-m", "initial"])
+
+    git!(test_root, ["init", "--bare", remote_repo])
+    git!(seed_repo, ["remote", "add", "origin", remote_repo])
+    git!(seed_repo, ["push", "-u", "origin", "dev"])
+    git!(remote_repo, ["symbolic-ref", "HEAD", "refs/heads/dev"])
+
+    git!(test_root, ["clone", remote_repo, workspace_repo])
+
+    base_sha = git_output!(workspace_repo, ["rev-parse", "HEAD"])
+
+    File.write!(Path.join(seed_repo, "README.md"), "two\n")
+    git!(seed_repo, ["add", "README.md"])
+    git!(seed_repo, ["commit", "-m", "advance"])
+    git!(seed_repo, ["push", "origin", "dev"])
+
+    next_sha = git_output!(seed_repo, ["rev-parse", "HEAD"])
+
+    %{
+      base_sha: base_sha,
+      next_sha: next_sha,
+      remote_repo: remote_repo,
+      seed_repo: seed_repo,
+      workspace_repo: workspace_repo
+    }
+  end
+
+  defp git!(repo, args) do
+    case System.cmd("git", ["-C", repo | args], stderr_to_stdout: true) do
+      {_output, 0} ->
+        :ok
+
+      {output, status} ->
+        flunk("git #{Enum.join(args, " ")} failed with status #{status}: #{output}")
+    end
+  end
+
+  defp git_output!(repo, args) do
+    case System.cmd("git", ["-C", repo | args], stderr_to_stdout: true) do
+      {output, 0} ->
+        String.trim(output)
+
+      {output, status} ->
+        flunk("git #{Enum.join(args, " ")} failed with status #{status}: #{output}")
     end
   end
 end

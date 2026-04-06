@@ -64,12 +64,13 @@ The workflows were changed so the agent does not start implementation immediatel
 Current behavior:
 
 1. Symphony picks up the Linear issue.
-2. The issue moves to `Plan Progress`.
-3. Codex writes the plan into the Linear workpad.
-4. The issue moves to `Plan Review` and pauses.
-5. A human reviews or edits the plan.
-6. A human approves the plan by moving the issue to `Code Progress`.
-7. Codex resumes implementation.
+2. Symphony core runs a serialized pre-run sync of the checked-out integration branch in the issue workspace before the first Codex turn when the workspace is still on `dev`/`main`/`master`.
+3. The issue moves to `Plan Progress`.
+4. Codex writes the plan into the Linear workpad.
+5. The issue moves to `Plan Review` and pauses.
+6. A human reviews or edits the plan.
+7. A human approves the plan by moving the issue to `Code Progress`.
+8. Codex resumes implementation.
 
 This gate is implemented through the `Plan Review Gate` section in each custom workflow.
 
