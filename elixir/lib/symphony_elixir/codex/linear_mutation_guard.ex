@@ -35,7 +35,6 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
         }
       }
     }
-  }
   """
 
   @create_comment_mutation """
