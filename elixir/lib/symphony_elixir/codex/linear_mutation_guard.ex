@@ -926,10 +926,12 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
 
     with true <- is_binary(current_state_name),
          {:ok, 1} <- transition_distance(issue_context, current_state_name, target_state_name),
+         review_state when is_binary(review_state) <- final_review_state_name(issue_context),
+         true <- normalize_state_name(review_state) == normalize_state_name(target_state_name),
          true <- active_state_name?(current_state_name),
          false <- active_state_name?(target_state_name),
          false <- terminal_state?(issue_context, target_state_name),
-         true <- last_active_state?(issue_context, current_state_name) do
+         true <- review_handoff_source_state?(issue_context, current_state_name, review_state) do
       true
     else
       _ -> false
@@ -937,49 +939,12 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
   end
 
   defp plan_gate_required?(issue_context) do
-    states = workflow_states(issue_context)
-
-    case last_active_state_index(states) do
-      nil ->
-        false
-
-      last_active_index ->
-        states
-        |> Enum.with_index()
-        |> Enum.any?(fn {state, index} ->
-          index < last_active_index and not active_state_node?(state) and not completed_state_node?(state)
-        end)
-    end
-  end
-
-  defp last_active_state?(issue_context, state_name) when is_binary(state_name) do
-    case workflow_states(issue_context) |> Enum.filter(&active_state_node?/1) |> List.last() do
-      %{"name" => last_active_name} -> normalize_state_name(last_active_name) == normalize_state_name(state_name)
-      _ -> false
-    end
-  end
-
-  defp last_active_state?(_issue_context, _state_name), do: false
-
-  defp last_active_state_index(states) when is_list(states) do
-    states
-    |> Enum.with_index()
-    |> Enum.reduce(nil, fn
-      {state, index}, acc when is_map(state) ->
-        if active_state_node?(state), do: index, else: acc
-
-      _other, acc ->
-        acc
-    end)
+    planning_review_state_name(issue_context) != nil
   end
 
   defp state_index(issue_context, state_name) when is_binary(state_name) do
-    case Enum.find_index(workflow_states(issue_context), fn
-           %{"name" => candidate_name} when is_binary(candidate_name) ->
-             normalize_state_name(candidate_name) == normalize_state_name(state_name)
-
-           _ ->
-             false
+    case Enum.find_index(business_state_sequence(issue_context), fn candidate_name ->
+           normalize_state_name(candidate_name) == normalize_state_name(state_name)
          end) do
       nil -> :error
       index -> {:ok, index}
@@ -987,6 +952,92 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
   end
 
   defp state_index(_issue_context, _state_name), do: :error
+
+  defp business_state_sequence(issue_context) do
+    active_states = Config.settings!().tracker.active_states
+    planning_review_state = planning_review_state_name(issue_context)
+    final_review_state = final_review_state_name(issue_context)
+
+    {states, _final_review_inserted?} =
+      Enum.reduce(Enum.with_index(active_states), {[], false}, fn {state_name, index}, {acc, inserted?} ->
+        next_acc = acc ++ [state_name]
+
+        next_acc =
+          if index == 1 and is_binary(planning_review_state) do
+            next_acc ++ [planning_review_state]
+          else
+            next_acc
+          end
+
+        cond do
+          inserted? or not is_binary(final_review_state) ->
+            {next_acc, inserted?}
+
+          final_review_anchor_index(active_states, planning_review_state, final_review_state) == index ->
+            {next_acc ++ [final_review_state], true}
+
+          true ->
+            {next_acc, false}
+        end
+      end)
+
+    states
+  end
+
+  defp final_review_anchor_index(active_states, planning_review_state, final_review_state)
+       when is_list(active_states) do
+    cond do
+      not is_binary(final_review_state) or active_states == [] ->
+        nil
+
+      is_binary(planning_review_state) and length(active_states) >= 3 ->
+        2
+
+      true ->
+        length(active_states) - 1
+    end
+  end
+
+  defp planning_review_state_name(issue_context) do
+    preferred_available_state_name(issue_context, ["Plan Review"])
+  end
+
+  defp final_review_state_name(issue_context) do
+    preferred_available_state_name(issue_context, ["Code Review", "Review"])
+  end
+
+  defp review_handoff_source_state?(issue_context, current_state_name, review_state) do
+    case state_index(issue_context, review_state) do
+      {:ok, review_index} when review_index > 0 ->
+        case Enum.at(business_state_sequence(issue_context), review_index - 1) do
+          predecessor when is_binary(predecessor) ->
+            normalize_state_name(predecessor) == normalize_state_name(current_state_name)
+
+          _ ->
+            false
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  defp preferred_available_state_name(issue_context, preferred_names) when is_list(preferred_names) do
+    available_names =
+      issue_context
+      |> get_in(["team", "states", "nodes"])
+      |> List.wrap()
+      |> Enum.flat_map(fn
+        %{"name" => state_name} when is_binary(state_name) -> [state_name]
+        _ -> []
+      end)
+
+    Enum.find_value(preferred_names, fn preferred_name ->
+      Enum.find(available_names, fn available_name ->
+        normalize_state_name(available_name) == normalize_state_name(preferred_name)
+      end)
+    end)
+  end
 
   defp workflow_states(issue_context) do
     issue_context
@@ -1028,12 +1079,6 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
   end
 
   defp completed_state?(_issue_context, _state_name), do: false
-
-  defp active_state_node?(%{"name" => state_name}) when is_binary(state_name), do: active_state_name?(state_name)
-  defp active_state_node?(_state), do: false
-
-  defp completed_state_node?(%{"type" => "completed"}), do: true
-  defp completed_state_node?(_state), do: false
 
   defp normalize_state_name(state_name) when is_binary(state_name) do
     state_name

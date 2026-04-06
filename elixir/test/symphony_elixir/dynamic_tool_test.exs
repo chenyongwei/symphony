@@ -482,6 +482,91 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
            }
   end
 
+  test "linear_graphql allows Plan Review using the business state machine even when team positions are non-adjacent" do
+    issue = %Issue{id: "issue-1", identifier: "MT-1", state: "Plan Progress"}
+    test_pid = self()
+
+    skewed_states = [
+      {"Backlog", "backlog", 0.0},
+      {"Todo", "unstarted", 1.0},
+      {"Plan Progress", "started", 1.5},
+      {"Done", "completed", 3.0},
+      {"Canceled", "canceled", 4.0},
+      {"Plan Review", "started", 1001.0},
+      {"Code Progress", "started", 1001.5},
+      {"Code Review", "started", 1002.0}
+    ]
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => issue_update_mutation(), "variables" => %{"issueId" => "issue-1", "stateId" => workflow_state_id("Plan Review")}},
+        issue: issue,
+        linear_client: fn query, variables, _opts ->
+          cond do
+            String.contains?(query, "SymphonyIssueGuardContext") ->
+              {:ok, %{"data" => %{"issue" => workflow_issue_context("Plan Progress", states: workflow_states(skewed_states))}}}
+
+            String.contains?(query, "issueUpdate") ->
+              send(test_pid, {:issue_update_called, variables})
+              {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+
+            true ->
+              flunk("unexpected Linear query #{query}")
+          end
+        end,
+        command_runner: fn _workspace, _worker_host, _command, _args ->
+          flunk("git/github checks should not run for the planning review gate")
+        end
+      )
+
+    assert response["success"] == true
+    assert Jason.decode!(response["output"]) == %{"data" => %{"issueUpdate" => %{"success" => true}}}
+    assert_received {:issue_update_called, %{"issueId" => "issue-1", "stateId" => state_id}}
+    assert state_id == workflow_state_id("Plan Review")
+  end
+
+  test "linear_graphql still blocks business-state jumps that skip required planning review" do
+    issue = %Issue{id: "issue-1", identifier: "MT-1", state: "Todo"}
+
+    skewed_states = [
+      {"Backlog", "backlog", 0.0},
+      {"Todo", "unstarted", 1.0},
+      {"Plan Progress", "started", 1.5},
+      {"Done", "completed", 3.0},
+      {"Plan Review", "started", 1001.0},
+      {"Code Progress", "started", 1001.5},
+      {"Code Review", "started", 1002.0}
+    ]
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => issue_update_mutation(), "variables" => %{"issueId" => "issue-1", "stateId" => workflow_state_id("Plan Review")}},
+        issue: issue,
+        linear_client: fn query, _variables, _opts ->
+          if String.contains?(query, "SymphonyIssueGuardContext") do
+            {:ok, %{"data" => %{"issue" => workflow_issue_context("Todo", states: workflow_states(skewed_states))}}}
+          else
+            flunk("mutation should be blocked before the original Linear mutation is executed")
+          end
+        end,
+        command_runner: fn _workspace, _worker_host, _command, _args ->
+          flunk("git/github checks should not run when the workflow transition is already invalid")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "message" => "Symphony blocks the requested issue state transition.",
+               "currentState" => "Todo",
+               "targetState" => "Plan Review"
+             }
+           }
+  end
+
   test "linear_graphql applies review handoff guards using ordered active states instead of fixed review names" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: ["Todo", "Doing"])
 
