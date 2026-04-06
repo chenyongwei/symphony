@@ -1046,6 +1046,127 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server halts the current turn immediately when a tool requests freeze" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-tool-halt-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-90C")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-tool-halt.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-tool-halt.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-90c"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-90c"}}}'
+            printf '%s\\n' '{"id":104,"method":"item/tool/call","params":{"name":"linear_graphql","callId":"call-90c","threadId":"thread-90c","turnId":"turn-90c","arguments":{"query":"mutation Freeze { noop }"}}}'
+            ;;
+          5)
+            sleep 10
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-tool-halt",
+        identifier: "MT-90C",
+        title: "Tool halt",
+        description: "Ensure halt-after-tool freezes the turn immediately",
+        state: "Plan Progress",
+        url: "https://example.org/issues/MT-90C",
+        labels: ["backend"]
+      }
+
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      tool_executor = fn _tool, _arguments ->
+        %{
+          "success" => true,
+          "contentItems" => [%{"type" => "inputText", "text" => ~s({"data":{"ok":true}})}],
+          "control" => %{
+            "haltAfterTool" => true,
+            "haltReason" => %{"type" => "pause_state_entered", "state" => "Plan Review"}
+          }
+        }
+      end
+
+      {elapsed_us, result} =
+        :timer.tc(fn ->
+          AppServer.run(workspace, "Freeze after tool call", issue,
+            on_message: on_message,
+            tool_executor: tool_executor
+          )
+        end)
+
+      assert {:ok, %{result: {:halted, %{"type" => "pause_state_entered", "state" => "Plan Review"}}}} =
+               result
+
+      assert elapsed_us < 2_000_000
+      assert_received {:app_server_message, %{event: :turn_halted}}
+
+      trace = File.read!(trace_file)
+      lines = String.split(trace, "\n", trim: true)
+
+      assert Enum.any?(lines, fn line ->
+               if String.starts_with?(line, "JSON:") do
+                 payload =
+                   line
+                   |> String.trim_leading("JSON:")
+                   |> Jason.decode!()
+
+                 payload["id"] == 104 and get_in(payload, ["result", "control", "haltAfterTool"]) == true
+               else
+                 false
+               end
+             end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server emits tool_call_failed for supported tool failures" do
     test_root =
       Path.join(

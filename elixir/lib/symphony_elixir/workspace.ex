@@ -6,6 +6,7 @@ defmodule SymphonyElixir.Workspace do
   require Logger
   alias SymphonyElixir.{Config, PathSafety, SSH}
 
+  @integration_branches ~w(dev main master)
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
   @type worker_host :: String.t() | nil
@@ -178,6 +179,120 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @spec sync_integration_branch(Path.t()) :: :ok | {:error, term()}
+  def sync_integration_branch(workspace), do: sync_integration_branch(workspace, nil)
+
+  @spec sync_integration_branch(Path.t(), worker_host()) :: :ok | {:error, term()}
+  def sync_integration_branch(workspace, nil) when is_binary(workspace) do
+    Logger.info("Syncing workspace integration branch before run workspace=#{workspace} worker_host=local")
+
+    case System.cmd("sh", ["-lc", integration_branch_sync_script()], cd: workspace, stderr_to_stdout: true) do
+      {_output, 0} ->
+        :ok
+
+      {output, status} ->
+        sanitized_output = sanitize_hook_output_for_log(output)
+
+        Logger.warning("Workspace integration sync failed workspace=#{workspace} worker_host=local status=#{status} output=#{inspect(sanitized_output)}")
+
+        {:error, {:workspace_sync_failed, status, output}}
+    end
+  end
+
+  def sync_integration_branch(workspace, worker_host) when is_binary(workspace) and is_binary(worker_host) do
+    Logger.info("Syncing workspace integration branch before run workspace=#{workspace} worker_host=#{worker_host}")
+
+    script =
+      [
+        remote_shell_assign("workspace", workspace),
+        "cd \"$workspace\"",
+        integration_branch_sync_script()
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} ->
+        :ok
+
+      {:ok, {output, status}} ->
+        sanitized_output = sanitize_hook_output_for_log(output)
+
+        Logger.warning("Workspace integration sync failed workspace=#{workspace} worker_host=#{worker_host} status=#{status} output=#{inspect(sanitized_output)}")
+
+        {:error, {:workspace_sync_failed, status, output}}
+
+      {:error, {:workspace_hook_timeout, "remote_command", timeout_ms}} ->
+        {:error, {:workspace_sync_timeout, timeout_ms}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec ensure_issue_feature_branch(Path.t(), map() | String.t() | nil) ::
+          :ok | {:error, term()}
+  def ensure_issue_feature_branch(workspace, issue_or_identifier),
+    do: ensure_issue_feature_branch(workspace, issue_or_identifier, nil)
+
+  @spec ensure_issue_feature_branch(Path.t(), map() | String.t() | nil, worker_host()) ::
+          :ok | {:error, term()}
+  def ensure_issue_feature_branch(workspace, issue_or_identifier, nil) when is_binary(workspace) do
+    issue_context = issue_context(issue_or_identifier)
+    branch_name = issue_feature_branch(issue_context.issue_identifier)
+
+    Logger.info("Ensuring workspace issue branch before run #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local branch=#{branch_name}")
+
+    case System.cmd("sh", ["-lc", issue_feature_branch_script(branch_name)], cd: workspace, stderr_to_stdout: true) do
+      {_output, 0} ->
+        :ok
+
+      {output, status} ->
+        sanitized_output = sanitize_hook_output_for_log(output)
+
+        Logger.warning(
+          "Workspace issue branch setup failed #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local branch=#{branch_name} status=#{status} output=#{inspect(sanitized_output)}"
+        )
+
+        {:error, {:workspace_issue_branch_failed, status, output}}
+    end
+  end
+
+  def ensure_issue_feature_branch(workspace, issue_or_identifier, worker_host)
+      when is_binary(workspace) and is_binary(worker_host) do
+    issue_context = issue_context(issue_or_identifier)
+    branch_name = issue_feature_branch(issue_context.issue_identifier)
+
+    Logger.info("Ensuring workspace issue branch before run #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host} branch=#{branch_name}")
+
+    script =
+      [
+        remote_shell_assign("workspace", workspace),
+        "cd \"$workspace\"",
+        issue_feature_branch_script(branch_name)
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} ->
+        :ok
+
+      {:ok, {output, status}} ->
+        sanitized_output = sanitize_hook_output_for_log(output)
+
+        Logger.warning(
+          "Workspace issue branch setup failed #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host} branch=#{branch_name} status=#{status} output=#{inspect(sanitized_output)}"
+        )
+
+        {:error, {:workspace_issue_branch_failed, status, output}}
+
+      {:error, {:workspace_hook_timeout, "remote_command", timeout_ms}} ->
+        {:error, {:workspace_issue_branch_timeout, timeout_ms}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   @spec run_after_run_hook(Path.t(), map() | String.t() | nil, worker_host()) :: :ok
   def run_after_run_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
     issue_context = issue_context(issue_or_identifier)
@@ -205,6 +320,10 @@ defmodule SymphonyElixir.Workspace do
 
   defp safe_identifier(identifier) do
     String.replace(identifier || "issue", ~r/[^a-zA-Z0-9._-]/, "_")
+  end
+
+  defp issue_feature_branch(identifier) do
+    "feature/" <> safe_identifier(identifier)
   end
 
   defp maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
@@ -290,6 +409,86 @@ defmodule SymphonyElixir.Workspace do
 
   defp ignore_hook_failure(:ok), do: :ok
   defp ignore_hook_failure({:error, _reason}), do: :ok
+
+  defp integration_branch_sync_script do
+    integration_case_pattern = Enum.join(@integration_branches, "|")
+
+    """
+    set -eu
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      exit 0
+    fi
+
+    current_branch="$(git branch --show-current 2>/dev/null || true)"
+
+    case "$current_branch" in
+      #{integration_case_pattern})
+        if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+          echo "workspace sync: refusing to sync dirty integration branch $current_branch" >&2
+          exit 20
+        fi
+
+        git fetch origin "$current_branch"
+        git merge --ff-only "origin/$current_branch"
+        ;;
+      *)
+        exit 0
+        ;;
+    esac
+    """
+  end
+
+  defp issue_feature_branch_script(branch_name) when is_binary(branch_name) do
+    """
+    set -eu
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      exit 0
+    fi
+
+    issue_branch=#{shell_escape(branch_name)}
+    current_branch="$(git branch --show-current 2>/dev/null || true)"
+
+    if [ "$current_branch" = "$issue_branch" ]; then
+      case "$current_branch" in
+        feature/*)
+          exit 0
+          ;;
+        *)
+          echo "workspace branch setup: expected feature/* branch, got $current_branch" >&2
+          exit 23
+          ;;
+      esac
+    fi
+
+    if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+      echo "workspace branch setup: refusing to switch branches with tracked local changes" >&2
+      exit 21
+    fi
+
+    if git show-ref --verify --quiet "refs/heads/$issue_branch"; then
+      git checkout "$issue_branch"
+    else
+      if ! git show-ref --verify --quiet "refs/remotes/origin/dev"; then
+        echo "workspace branch setup: missing origin/dev" >&2
+        exit 22
+      fi
+
+      git checkout -B "$issue_branch" "origin/dev"
+    fi
+
+    current_branch="$(git branch --show-current 2>/dev/null || true)"
+
+    case "$current_branch" in
+      feature/*)
+        exit 0
+        ;;
+      *)
+        echo "workspace branch setup: expected feature/* branch, got $current_branch" >&2
+        exit 23
+        ;;
+    esac
+    """
+  end
 
   defp run_hook(command, workspace, issue_context, hook_name, nil) do
     timeout_ms = Config.settings!().hooks.timeout_ms
