@@ -303,6 +303,16 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   end
 
+  defp tool_error_payload({:planning_review_reentry_blocked, current_state, target_state}) do
+    %{
+      "error" => %{
+        "message" => "Symphony treats a human move into implementation as plan approval and blocks reverting the issue back to planning review.",
+        "currentState" => current_state,
+        "targetState" => target_state
+      }
+    }
+  end
+
   defp tool_error_payload({:cross_issue_mutation_blocked, current_issue_id, target_issue_id}) do
     %{
       "error" => %{
@@ -347,6 +357,16 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "message" => "Symphony blocks final review handoff when the pull request branch does not match the current workspace branch.",
         "pullRequestBranch" => pr_branch,
         "currentBranch" => current_branch
+      }
+    }
+  end
+
+  defp tool_error_payload({:pull_request_base_branch_mismatch, pr_base_branch, required_base_branch}) do
+    %{
+      "error" => %{
+        "message" => "Symphony blocks final review handoff unless the pull request base branch is `dev`.",
+        "pullRequestBaseBranch" => pr_base_branch,
+        "requiredBaseBranch" => required_base_branch
       }
     }
   end
@@ -492,6 +512,23 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       "error" => %{
         "message" => "Symphony requires the live `## Codex Workpad` comment to match the expected structure.",
         "errors" => errors
+      }
+    }
+  end
+
+  defp tool_error_payload(:planning_review_requires_workpad) do
+    %{
+      "error" => %{
+        "message" => "Symphony blocks the move to `Plan Review` until a live `## Codex Workpad` comment exists on the issue."
+      }
+    }
+  end
+
+  defp tool_error_payload({:plan_review_gate_not_pending, gate_status}) do
+    %{
+      "error" => %{
+        "message" => "Symphony blocks the move to `Plan Review` until the live workpad gate is set to `pending-human-review`.",
+        "gateStatus" => gate_status
       }
     }
   end

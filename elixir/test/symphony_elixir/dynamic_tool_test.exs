@@ -505,7 +505,16 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         linear_client: fn query, variables, _opts ->
           cond do
             String.contains?(query, "SymphonyIssueGuardContext") ->
-              {:ok, %{"data" => %{"issue" => workflow_issue_context("Plan Progress", states: workflow_states(skewed_states))}}}
+              {:ok,
+               %{
+                 "data" => %{
+                   "issue" =>
+                     workflow_issue_context("Plan Progress",
+                       states: workflow_states(skewed_states),
+                       comments: [valid_workpad_body(plan_gate?: true)]
+                     )
+                 }
+               }}
 
             String.contains?(query, "issueUpdate") ->
               send(test_pid, {:issue_update_called, variables})
@@ -524,6 +533,35 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert Jason.decode!(response["output"]) == %{"data" => %{"issueUpdate" => %{"success" => true}}}
     assert_received {:issue_update_called, %{"issueId" => "issue-1", "stateId" => state_id}}
     assert state_id == workflow_state_id("Plan Review")
+  end
+
+  test "linear_graphql blocks Plan Review when the live workpad has not been created yet" do
+    issue = %Issue{id: "issue-1", identifier: "MT-1", state: "Plan Progress"}
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => issue_update_mutation(), "variables" => %{"issueId" => "issue-1", "stateId" => workflow_state_id("Plan Review")}},
+        issue: issue,
+        linear_client: fn query, _variables, _opts ->
+          if String.contains?(query, "SymphonyIssueGuardContext") do
+            {:ok, %{"data" => %{"issue" => workflow_issue_context("Plan Progress")}}}
+          else
+            flunk("mutation should be blocked before the original Linear mutation is executed")
+          end
+        end,
+        command_runner: fn _workspace, _worker_host, _command, _args ->
+          flunk("git/github checks should not run for the planning review gate")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "message" => "Symphony blocks the move to `Plan Review` until a live `## Codex Workpad` comment exists on the issue."
+             }
+           }
   end
 
   test "linear_graphql still blocks business-state jumps that skip required planning review" do
@@ -562,6 +600,47 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
              "error" => %{
                "message" => "Symphony blocks the requested issue state transition.",
                "currentState" => "Todo",
+               "targetState" => "Plan Review"
+             }
+           }
+  end
+
+  test "linear_graphql blocks reverting implementation back to planning review after human approval" do
+    issue = %Issue{id: "issue-1", identifier: "MT-1", state: "Code Progress"}
+
+    skewed_states = [
+      {"Backlog", "backlog", 0.0},
+      {"Todo", "unstarted", 1.0},
+      {"Plan Progress", "started", 1.5},
+      {"Done", "completed", 3.0},
+      {"Plan Review", "started", 1001.0},
+      {"Code Progress", "started", 1001.5},
+      {"Code Review", "started", 1002.0}
+    ]
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => issue_update_mutation(), "variables" => %{"issueId" => "issue-1", "stateId" => workflow_state_id("Plan Review")}},
+        issue: issue,
+        linear_client: fn query, _variables, _opts ->
+          if String.contains?(query, "SymphonyIssueGuardContext") do
+            {:ok, %{"data" => %{"issue" => workflow_issue_context("Code Progress", states: workflow_states(skewed_states))}}}
+          else
+            flunk("mutation should be blocked before the original Linear mutation is executed")
+          end
+        end,
+        command_runner: fn _workspace, _worker_host, _command, _args ->
+          flunk("git/github checks should not run when reverting to planning review is already blocked")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "message" => "Symphony treats a human move into implementation as plan approval and blocks reverting the issue back to planning review.",
+               "currentState" => "Code Progress",
                "targetState" => "Plan Review"
              }
            }
@@ -708,6 +787,54 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                "title" => "Fix bug"
              }
            }
+  end
+
+  test "linear_graphql allows Code Review when the PR title starts with the issue key and a bracketed scope" do
+    issue = %Issue{id: "issue-1", identifier: "MT-1", state: "Code Progress"}
+    workspace = workspace_with_pr_template!()
+
+    on_exit(fn -> File.rm_rf!(workspace) end)
+
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => issue_update_mutation(), "variables" => %{"issueId" => "issue-1", "stateId" => workflow_state_id("Code Review")}},
+        issue: issue,
+        workspace: workspace,
+        linear_client: fn query, variables, opts ->
+          send(test_pid, {:linear_client_called, query, variables, opts})
+
+          cond do
+            String.contains?(query, "SymphonyIssueGuardContext") ->
+              {:ok, %{"data" => %{"issue" => workflow_issue_context("Code Progress")}}}
+
+            String.contains?(query, "attachmentLinkGitHubPR") ->
+              {:ok, %{"data" => %{"attachmentLinkGitHubPR" => %{"success" => true}}}}
+
+            String.contains?(query, "issueUpdate") ->
+              {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+
+            true ->
+              flunk("unexpected Linear query #{query}")
+          end
+        end,
+        command_runner:
+          successful_review_command_runner(%{
+            "title" => "MT-1 [INT-012] Fix bug",
+            "body" => valid_pr_body(),
+            "url" => "https://github.com/openai/symphony/pull/42",
+            "state" => "OPEN",
+            "isDraft" => false,
+            "headRefName" => "feature/MT-1",
+            "reviewThreads" => %{"nodes" => []},
+            "commits" => %{"nodes" => [%{"commit" => %{"statusCheckRollup" => %{"state" => "SUCCESS"}}}]}
+          })
+      )
+
+    assert response["success"] == true
+    assert Jason.decode!(response["output"]) == %{"data" => %{"issueUpdate" => %{"success" => true}}}
   end
 
   test "linear_graphql allows Code Review when PR checks are not green" do
@@ -935,6 +1062,50 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                state_id_variable(variables) == expected_state_id and
                String.contains?(query, "issueUpdate")
            end)
+  end
+
+  test "linear_graphql blocks Code Review when the pull request base branch is not dev" do
+    issue = %Issue{id: "issue-1", identifier: "MT-1", state: "Code Progress"}
+    workspace = workspace_with_pr_template!()
+
+    on_exit(fn -> File.rm_rf!(workspace) end)
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => issue_update_mutation(), "variables" => %{"issueId" => "issue-1", "stateId" => workflow_state_id("Code Review")}},
+        issue: issue,
+        workspace: workspace,
+        linear_client: fn query, _variables, _opts ->
+          if String.contains?(query, "SymphonyIssueGuardContext") do
+            {:ok, %{"data" => %{"issue" => workflow_issue_context("Code Progress")}}}
+          else
+            flunk("original mutation should not run when the pull request base branch is not dev")
+          end
+        end,
+        command_runner:
+          successful_review_command_runner(%{
+            "title" => "MT-1: Fix bug",
+            "body" => valid_pr_body(),
+            "url" => "https://github.com/openai/symphony/pull/42",
+            "state" => "OPEN",
+            "isDraft" => false,
+            "baseRefName" => "main",
+            "headRefName" => "feature/MT-1",
+            "reviewThreads" => %{"nodes" => []},
+            "commits" => %{"nodes" => [%{"commit" => %{"statusCheckRollup" => %{"state" => "SUCCESS"}}}]}
+          })
+      )
+
+    assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "message" => "Symphony blocks final review handoff unless the pull request base branch is `dev`.",
+               "pullRequestBaseBranch" => "main",
+               "requiredBaseBranch" => "dev"
+             }
+           }
   end
 
   test "linear_graphql blocks screenshot attachment mutations for e2e evidence" do
@@ -1477,7 +1648,15 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
          pr_details
        ) do
     assert String.starts_with?(query, "query=")
-    {:ok, Jason.encode!(%{"data" => %{"repository" => %{"pullRequest" => pr_details}}})}
+
+    {:ok,
+     Jason.encode!(%{
+       "data" => %{
+         "repository" => %{
+           "pullRequest" => Map.put_new(pr_details, "baseRefName", "dev")
+         }
+       }
+     })}
   end
 
   defp successful_review_command_response(other, _branch, _local_head, _remote_head, _worktree_status, _merge_base_status, _pr_details) do

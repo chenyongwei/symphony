@@ -74,6 +74,7 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
         url
         state
         isDraft
+        baseRefName
         headRefName
         reviewDecision
         reviewRequests(first: 100) {
@@ -154,6 +155,7 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
          {:ok, issue_context} <- fetch_issue_context(linear_client, issue_id),
          {:ok, target_state_name} <- resolve_target_state_name(issue_context, state_id),
          :ok <- ensure_allowed_transition(issue_context, target_state_name),
+         :ok <- maybe_guard_planning_review_handoff(target_state_name, issue_context),
          :ok <- maybe_guard_review_handoff(target_state_name, issue_context, opts) do
       {:ok, maybe_halt_after_transition(target_state_name, issue_context)}
     end
@@ -245,7 +247,7 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
       true ->
         case transition_distance(issue_context, current_state_name, target_state_name) do
           {:ok, distance} when abs(distance) == 1 ->
-            :ok
+            ensure_not_reverting_to_planning_review(issue_context, current_state_name, target_state_name, distance)
 
           {:ok, _distance} ->
             {:error, {:invalid_issue_state_transition, current_state_name, target_state_name}}
@@ -256,11 +258,43 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
     end
   end
 
+  defp ensure_not_reverting_to_planning_review(
+         issue_context,
+         current_state_name,
+         target_state_name,
+         distance
+       )
+       when is_binary(current_state_name) and is_binary(target_state_name) and is_integer(distance) do
+    planning_review_state = planning_review_state_name(issue_context)
+
+    cond do
+      distance >= 0 ->
+        :ok
+
+      not is_binary(planning_review_state) ->
+        :ok
+
+      normalize_state_name(target_state_name) != normalize_state_name(planning_review_state) ->
+        :ok
+
+      true ->
+        {:error, {:planning_review_reentry_blocked, current_state_name, target_state_name}}
+    end
+  end
+
   defp maybe_halt_after_transition(target_state_name, issue_context) do
     if should_halt_after_transition?(issue_context, target_state_name) do
       %{halt_after_successful_state_transition: target_state_name}
     else
       %{}
+    end
+  end
+
+  defp maybe_guard_planning_review_handoff(target_state_name, issue_context) do
+    if planning_review_transition?(issue_context, target_state_name) do
+      ensure_plan_review_workpad_ready(issue_context)
+    else
+      :ok
     end
   end
 
@@ -486,6 +520,7 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
   defp ensure_pull_request_ready(pr_details, current_branch, issue_context, workspace) do
     with :ok <- ensure_pull_request_open(pr_details),
          :ok <- ensure_pull_request_not_draft(pr_details),
+         :ok <- ensure_pull_request_base_branch(pr_details),
          :ok <- ensure_pull_request_branch_matches(pr_details, current_branch),
          :ok <- ensure_pull_request_title_prefix(pr_details, issue_context) do
       ensure_pull_request_body_valid(pr_details, workspace)
@@ -510,6 +545,17 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
     end
   end
 
+  defp ensure_pull_request_base_branch(pr_details) do
+    pr_base_branch = Map.get(pr_details, "baseRefName")
+    required_base_branch = "dev"
+
+    if pr_base_branch == required_base_branch do
+      :ok
+    else
+      {:error, {:pull_request_base_branch_mismatch, pr_base_branch, required_base_branch}}
+    end
+  end
+
   defp ensure_pull_request_branch_matches(pr_details, current_branch) do
     pr_branch = Map.get(pr_details, "headRefName")
 
@@ -524,12 +570,20 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
     identifier = Map.get(issue_context, "identifier")
     title = Map.get(pr_details, "title") || ""
 
-    if String.starts_with?(title, "#{identifier}:") do
+    if pull_request_title_has_issue_prefix?(title, identifier) do
       :ok
     else
       {:error, {:pull_request_title_prefix_missing, identifier, title}}
     end
   end
+
+  defp pull_request_title_has_issue_prefix?(title, identifier)
+       when is_binary(title) and is_binary(identifier) do
+    pattern = ~r/^#{Regex.escape(identifier)}(?:$|:|：|\s|-|\[)/
+    Regex.match?(pattern, title)
+  end
+
+  defp pull_request_title_has_issue_prefix?(_title, _identifier), do: false
 
   defp ensure_pull_request_body_valid(pr_details, workspace) do
     body = Map.get(pr_details, "body") || ""
@@ -678,6 +732,25 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
     end
   end
 
+  defp ensure_plan_review_workpad_ready(issue_context) do
+    workpad_comments = existing_workpad_comments(issue_context)
+
+    cond do
+      length(workpad_comments) > 1 ->
+        {:error, {:multiple_workpad_comments, length(workpad_comments)}}
+
+      workpad_comments == [] ->
+        {:error, :planning_review_requires_workpad}
+
+      true ->
+        [%{"body" => body}] = workpad_comments
+
+        with :ok <- ensure_workpad_structure(issue_context, body) do
+          ensure_plan_review_gate_pending(body)
+        end
+    end
+  end
+
   defp existing_workpad_comments(issue_context) do
     issue_context
     |> get_in(["comments", "nodes"])
@@ -717,6 +790,22 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
          ) do
       :ok -> :ok
       {:error, errors} -> {:error, {:invalid_workpad_structure, errors}}
+    end
+  end
+
+  defp ensure_plan_review_gate_pending(body) when is_binary(body) do
+    case Regex.named_captures(
+           ~r/###\s+Plan Review Gate[\s\S]*?-\s+Gate status:\s+`(?<status>[^`]+)`/m,
+           body
+         ) do
+      %{"status" => "pending-human-review"} ->
+        :ok
+
+      %{"status" => gate_status} ->
+        {:error, {:plan_review_gate_not_pending, gate_status}}
+
+      _ ->
+        {:error, {:plan_review_gate_not_pending, nil}}
     end
   end
 
@@ -932,6 +1021,23 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
          false <- active_state_name?(target_state_name),
          false <- terminal_state?(issue_context, target_state_name),
          true <- review_handoff_source_state?(issue_context, current_state_name, review_state) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp planning_review_transition?(issue_context, target_state_name) do
+    current_state_name = get_in(issue_context, ["state", "name"])
+
+    with true <- is_binary(current_state_name),
+         {:ok, 1} <- transition_distance(issue_context, current_state_name, target_state_name),
+         planning_review_state when is_binary(planning_review_state) <- planning_review_state_name(issue_context),
+         true <- normalize_state_name(planning_review_state) == normalize_state_name(target_state_name),
+         true <- active_state_name?(current_state_name),
+         false <- active_state_name?(target_state_name),
+         false <- terminal_state?(issue_context, target_state_name),
+         true <- review_handoff_source_state?(issue_context, current_state_name, planning_review_state) do
       true
     else
       _ -> false
