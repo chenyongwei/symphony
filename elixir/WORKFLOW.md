@@ -84,6 +84,16 @@ Work only in the provided repository copy. Do not touch any other path.
 
 The agent should be able to talk to Linear, either via a configured Linear MCP server or injected `linear_graphql` tool. If none are present, stop and ask the user to configure Linear.
 
+When using raw Linear GraphQL:
+
+- Prefer `issue(id: "{{ issue.identifier }}")` for ticket reads; if you already
+  have the internal issue id, continue using `issue(id: ...)`.
+- Do not rely on `issues(filter: { identifier: ... })` for routine issue lookup.
+- Keep queries narrow and avoid broad schema introspection over `Query`,
+  `Mutation`, or large connection types.
+- When reading workflow states, request `position` and sort by it before making
+  any workflow-order decision.
+
 ## Default posture
 
 - Start by determining the ticket's current status, then follow the matching flow for that status.

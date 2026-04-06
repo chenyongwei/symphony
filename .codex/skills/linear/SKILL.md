@@ -37,6 +37,16 @@ Tool behavior:
 When you need an unfamiliar mutation, input type, or object field, use targeted
 introspection through `linear_graphql`.
 
+Guardrails:
+
+- Avoid broad schema discovery queries against `Query`, `Mutation`, or large
+  connection types unless you truly cannot proceed otherwise.
+- Prefer introspecting one specific type or input object at a time.
+- If a previous query returned a complexity error, shrink the next query before
+  retrying.
+- Prefer direct issue lookups with `issue(id: $value)` for both issue keys
+  (for example `PT-91`) and internal ids.
+
 List mutation names:
 
 ```graphql
@@ -76,8 +86,11 @@ query CommentCreateInputShape {
 Use these progressively:
 
 - Start with `issue(id: $key)` when you have a ticket key such as `MT-686`.
-- Fall back to `issues(filter: ...)` when you need identifier search semantics.
-- Once you have the internal issue id, prefer `issue(id: $id)` for narrower reads.
+- Keep using `issue(id: $value)` once you have the internal issue id; Linear
+  accepts both issue keys and internal ids on this field.
+- Do not use `issues(filter: { identifier: ... })` as a generic fallback here;
+  that shape is not reliable across Linear schemas and has caused GraphQL 400
+  responses in production sessions.
 
 Lookup by issue key:
 
@@ -106,33 +119,6 @@ query IssueByKey($key: String!) {
         url
         title
       }
-    }
-  }
-}
-```
-
-Lookup by identifier filter:
-
-```graphql
-query IssueByIdentifier($identifier: String!) {
-  issues(filter: { identifier: { eq: $identifier } }, first: 1) {
-    nodes {
-      id
-      identifier
-      title
-      state {
-        id
-        name
-        type
-      }
-      project {
-        id
-        name
-      }
-      branchName
-      url
-      description
-      updatedAt
     }
   }
 }
@@ -198,12 +184,16 @@ query IssueTeamStates($id: String!) {
           id
           name
           type
+          position
         }
       }
     }
   }
 }
 ```
+
+After reading workflow states, sort them by `position` before making any
+state-machine decision. Do not trust the raw `nodes` array order.
 
 ### Edit an existing comment
 
