@@ -63,12 +63,17 @@ defmodule Mix.Tasks.PrBody.Check do
     end
   end
 
-  defp invalid_pr_body_result(template_path, [message]) when is_binary(message) do
-    if String.starts_with?(message, "No markdown headings found") do
-      {:error, message}
-    else
-      Enum.each([message], fn err -> Mix.shell().error("ERROR: #{err}") end)
-      {:error, "PR body format invalid. Read `#{template_path}` and follow it precisely."}
+  defp invalid_pr_body_result(template_path, [message]) do
+    cond do
+      not is_binary(message) ->
+        invalid_pr_body_result(template_path, List.wrap([message]))
+
+      String.starts_with?(message, "No markdown headings found") ->
+        {:error, message}
+
+      true ->
+        Enum.each([message], fn err -> Mix.shell().error("ERROR: #{err}") end)
+        {:error, "PR body format invalid. Read `#{template_path}` and follow it precisely."}
     end
   end
 

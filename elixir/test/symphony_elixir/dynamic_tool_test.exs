@@ -3,6 +3,14 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
   alias SymphonyElixir.Codex.DynamicTool
 
+  setup do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "Plan Progress", "Code Progress"]
+    )
+
+    :ok
+  end
+
   test "tool_specs advertises the linear_graphql input contract" do
     assert [
              %{
@@ -339,6 +347,149 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
            }
   end
 
+  test "linear_graphql accepts issueUpdate mutations that pass input via a variable object" do
+    issue = %Issue{id: "issue-1", identifier: "MT-1", state: "Todo"}
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{
+          "query" => issue_update_with_input_variable_mutation(),
+          "variables" => %{
+            "issueId" => "issue-1",
+            "input" => %{"stateId" => workflow_state_id("Plan Progress")}
+          }
+        },
+        issue: issue,
+        linear_client: fn query, variables, _opts ->
+          cond do
+            String.contains?(query, "SymphonyIssueGuardContext") ->
+              {:ok, %{"data" => %{"issue" => workflow_issue_context("Todo")}}}
+
+            String.contains?(query, "issueUpdate") ->
+              send(test_pid, {:issue_update_called, variables})
+              {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+
+            true ->
+              flunk("unexpected Linear query #{query}")
+          end
+        end
+      )
+
+    assert response["success"] == true
+    assert Jason.decode!(response["output"]) == %{"data" => %{"issueUpdate" => %{"success" => true}}}
+
+    assert_received {:issue_update_called, %{"issueId" => "issue-1", "input" => %{"stateId" => state_id}}}
+
+    assert state_id == workflow_state_id("Plan Progress")
+  end
+
+  test "linear_graphql blocks non-adjacent transitions using the workflow state order" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: ["Todo", "Doing"])
+
+    issue = %Issue{id: "issue-1", identifier: "MT-1", state: "Todo"}
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => issue_update_mutation(), "variables" => %{"issueId" => "issue-1", "stateId" => workflow_state_id("Review")}},
+        issue: issue,
+        linear_client: fn query, _variables, _opts ->
+          if String.contains?(query, "SymphonyIssueGuardContext") do
+            {:ok,
+             %{
+               "data" => %{
+                 "issue" =>
+                   workflow_issue_context("Todo",
+                     states:
+                       workflow_states([
+                         {"Todo", "unstarted"},
+                         {"Doing", "started"},
+                         {"Review", "unstarted"},
+                         {"Done", "completed"}
+                       ])
+                   )
+               }
+             }}
+          else
+            flunk("mutation should be blocked before the original Linear mutation is executed")
+          end
+        end,
+        command_runner: fn _workspace, _worker_host, _command, _args ->
+          flunk("git/github checks should not run when the workflow transition is already invalid")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "message" => "Symphony blocks the requested issue state transition.",
+               "currentState" => "Todo",
+               "targetState" => "Review"
+             }
+           }
+  end
+
+  test "linear_graphql applies review handoff guards using ordered active states instead of fixed review names" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: ["Todo", "Doing"])
+
+    issue = %Issue{id: "issue-1", identifier: "MT-1", state: "Doing"}
+    workspace = workspace_with_pr_template!()
+
+    on_exit(fn -> File.rm_rf!(workspace) end)
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => issue_update_mutation(), "variables" => %{"issueId" => "issue-1", "stateId" => workflow_state_id("Review")}},
+        issue: issue,
+        workspace: workspace,
+        linear_client: fn query, _variables, _opts ->
+          if String.contains?(query, "SymphonyIssueGuardContext") do
+            {:ok,
+             %{
+               "data" => %{
+                 "issue" =>
+                   workflow_issue_context("Doing",
+                     states:
+                       workflow_states([
+                         {"Todo", "unstarted"},
+                         {"Doing", "started"},
+                         {"Review", "unstarted"},
+                         {"Done", "completed"}
+                       ])
+                   )
+               }
+             }}
+          else
+            flunk("original mutation should not run when no PR is open")
+          end
+        end,
+        command_runner: fn _workspace, _worker_host, command, args ->
+          case {command, args} do
+            {"git", ["branch", "--show-current"]} -> {:ok, "feature/MT-1\n"}
+            {"git", ["fetch", "origin", "dev"]} -> {:ok, ""}
+            {"git", ["status", "--porcelain", "--untracked-files=no"]} -> {:ok, ""}
+            {"git", ["ls-remote", "--heads", "origin", "feature/MT-1"]} -> {:ok, "abc123\trefs/heads/feature/MT-1\n"}
+            {"git", ["rev-parse", "HEAD"]} -> {:ok, "abc123\n"}
+            {"git", ["merge-base", "--is-ancestor", "refs/remotes/origin/dev", "HEAD"]} -> {:ok, ""}
+            {"gh", ["pr", "list", "--head", "feature/MT-1", "--state", "open", "--limit", "10", "--json", "number"]} -> {:ok, "[]"}
+            other -> flunk("unexpected command #{inspect(other)}")
+          end
+        end
+      )
+
+    assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "message" => "Symphony blocks final review handoff until the current `feature/*` branch has an open pull request."
+             }
+           }
+  end
+
   test "linear_graphql blocks Code Review without an open pull request" do
     issue = %Issue{id: "issue-1", identifier: "MT-1", state: "Code Progress"}
     workspace = workspace_with_pr_template!()
@@ -376,7 +527,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert Jason.decode!(response["output"]) == %{
              "error" => %{
-               "message" => "Symphony blocks `Code Review` until the current `feature/*` branch has an open pull request."
+               "message" => "Symphony blocks final review handoff until the current `feature/*` branch has an open pull request."
              }
            }
   end
@@ -417,18 +568,20 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert Jason.decode!(response["output"]) == %{
              "error" => %{
-               "message" => "Symphony requires PR titles to start with the Linear identifier prefix before entering `Code Review`.",
+               "message" => "Symphony requires PR titles to start with the Linear identifier prefix before final review handoff.",
                "expectedPrefix" => "MT-1:",
                "title" => "Fix bug"
              }
            }
   end
 
-  test "linear_graphql blocks Code Review when PR checks are not green" do
+  test "linear_graphql allows Code Review when PR checks are not green" do
     issue = %Issue{id: "issue-1", identifier: "MT-1", state: "Code Progress"}
     workspace = workspace_with_pr_template!()
 
     on_exit(fn -> File.rm_rf!(workspace) end)
+
+    test_pid = self()
 
     response =
       DynamicTool.execute(
@@ -436,11 +589,21 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         %{"query" => issue_update_mutation(), "variables" => %{"issueId" => "issue-1", "stateId" => workflow_state_id("Code Review")}},
         issue: issue,
         workspace: workspace,
-        linear_client: fn query, _variables, _opts ->
-          if String.contains?(query, "SymphonyIssueGuardContext") do
-            {:ok, %{"data" => %{"issue" => workflow_issue_context("Code Progress")}}}
-          else
-            flunk("original mutation should not run when checks are not green")
+        linear_client: fn query, variables, opts ->
+          send(test_pid, {:linear_client_called, query, variables, opts})
+
+          cond do
+            String.contains?(query, "SymphonyIssueGuardContext") ->
+              {:ok, %{"data" => %{"issue" => workflow_issue_context("Code Progress")}}}
+
+            String.contains?(query, "commentCreate") ->
+              {:ok, %{"data" => %{"commentCreate" => %{"success" => true}}}}
+
+            String.contains?(query, "issueUpdate") ->
+              {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+
+            true ->
+              flunk("unexpected Linear query #{query}")
           end
         end,
         command_runner:
@@ -456,21 +619,23 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
           })
       )
 
-    assert response["success"] == false
+    assert response["success"] == true
+    assert Jason.decode!(response["output"]) == %{"data" => %{"issueUpdate" => %{"success" => true}}}
 
-    assert Jason.decode!(response["output"]) == %{
-             "error" => %{
-               "message" => "Symphony blocks `Code Review` until pull request checks are green.",
-               "statusCheckState" => "PENDING"
-             }
-           }
+    linear_calls = Enum.map(1..3, fn _index -> receive_linear_client_call!() end)
+
+    assert Enum.any?(linear_calls, fn {query, _variables, _opts} ->
+             String.contains?(query, "issueUpdate")
+           end)
   end
 
-  test "linear_graphql blocks Code Review when review threads are unresolved" do
+  test "linear_graphql allows Code Review when review threads are unresolved" do
     issue = %Issue{id: "issue-1", identifier: "MT-1", state: "Code Progress"}
     workspace = workspace_with_pr_template!()
 
     on_exit(fn -> File.rm_rf!(workspace) end)
+
+    test_pid = self()
 
     response =
       DynamicTool.execute(
@@ -478,11 +643,21 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         %{"query" => issue_update_mutation(), "variables" => %{"issueId" => "issue-1", "stateId" => workflow_state_id("Code Review")}},
         issue: issue,
         workspace: workspace,
-        linear_client: fn query, _variables, _opts ->
-          if String.contains?(query, "SymphonyIssueGuardContext") do
-            {:ok, %{"data" => %{"issue" => workflow_issue_context("Code Progress")}}}
-          else
-            flunk("original mutation should not run when review threads are unresolved")
+        linear_client: fn query, variables, opts ->
+          send(test_pid, {:linear_client_called, query, variables, opts})
+
+          cond do
+            String.contains?(query, "SymphonyIssueGuardContext") ->
+              {:ok, %{"data" => %{"issue" => workflow_issue_context("Code Progress")}}}
+
+            String.contains?(query, "commentCreate") ->
+              {:ok, %{"data" => %{"commentCreate" => %{"success" => true}}}}
+
+            String.contains?(query, "issueUpdate") ->
+              {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+
+            true ->
+              flunk("unexpected Linear query #{query}")
           end
         end,
         command_runner:
@@ -498,14 +673,14 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
           })
       )
 
-    assert response["success"] == false
+    assert response["success"] == true
+    assert Jason.decode!(response["output"]) == %{"data" => %{"issueUpdate" => %{"success" => true}}}
 
-    assert Jason.decode!(response["output"]) == %{
-             "error" => %{
-               "message" => "Symphony blocks `Code Review` while PR review threads are still unresolved.",
-               "unresolvedThreadCount" => 1
-             }
-           }
+    linear_calls = Enum.map(1..3, fn _index -> receive_linear_client_call!() end)
+
+    assert Enum.any?(linear_calls, fn {query, _variables, _opts} ->
+             String.contains?(query, "issueUpdate")
+           end)
   end
 
   test "linear_graphql blocks Code Review when screenshot evidence is still attached to the issue" do
@@ -552,7 +727,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert Jason.decode!(response["output"]) == %{
              "error" => %{
-               "message" => "Symphony blocks `Code Review` while screenshot evidence is still attached as issue attachments. Move it into Linear comments instead.",
+               "message" => "Symphony blocks final review handoff while screenshot evidence is still attached as issue attachments. Move it into Linear comments instead.",
                "attachmentCount" => 1
              }
            }
@@ -929,32 +1104,49 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     """
   end
 
+  defp issue_update_with_input_variable_mutation do
+    """
+    mutation UpdateIssueState($issueId: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $issueId, input: $input) {
+        success
+      }
+    }
+    """
+  end
+
   defp workflow_issue_context(current_state, overrides \\ []) do
     attachments = Keyword.get(overrides, :attachments, [])
     comments = Keyword.get(overrides, :comments, [])
     description = Keyword.get(overrides, :description, "")
+    states = Keyword.get(overrides, :states, workflow_states())
 
     %{
       "id" => "issue-1",
       "identifier" => "MT-1",
       "description" => description,
       "state" => %{"name" => current_state},
-      "team" => %{"states" => %{"nodes" => workflow_states()}},
+      "team" => %{"states" => %{"nodes" => states}},
       "attachments" => %{"nodes" => attachments},
       "comments" => %{"nodes" => Enum.map(Enum.with_index(comments, 1), &comment_node/1)}
     }
   end
 
   defp workflow_states do
-    [
-      %{"id" => workflow_state_id("Todo"), "name" => "Todo", "type" => "unstarted"},
-      %{"id" => workflow_state_id("Plan Progress"), "name" => "Plan Progress", "type" => "started"},
-      %{"id" => workflow_state_id("Plan Review"), "name" => "Plan Review", "type" => "unstarted"},
-      %{"id" => workflow_state_id("Code Progress"), "name" => "Code Progress", "type" => "started"},
-      %{"id" => workflow_state_id("Code Review"), "name" => "Code Review", "type" => "started"},
-      %{"id" => workflow_state_id("Rework"), "name" => "Rework", "type" => "started"},
-      %{"id" => workflow_state_id("Done"), "name" => "Done", "type" => "completed"}
-    ]
+    workflow_states([
+      {"Todo", "unstarted"},
+      {"Plan Progress", "started"},
+      {"Plan Review", "unstarted"},
+      {"Code Progress", "started"},
+      {"Code Review", "started"},
+      {"Rework", "started"},
+      {"Done", "completed"}
+    ])
+  end
+
+  defp workflow_states(definitions) when is_list(definitions) do
+    Enum.map(definitions, fn {name, type} ->
+      %{"id" => workflow_state_id(name), "name" => name, "type" => type}
+    end)
   end
 
   defp workflow_state_id(name) do

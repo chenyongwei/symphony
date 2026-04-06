@@ -1,26 +1,7 @@
 defmodule SymphonyElixir.Codex.LinearMutationGuard do
   @moduledoc false
 
-  alias SymphonyElixir.{PullRequestBody, SSH, Workpad}
-
-  @workflow_state_names [
-    "Todo",
-    "Plan Progress",
-    "Plan Review",
-    "Code Progress",
-    "Code Review",
-    "Rework"
-  ]
-
-  @transition_graph %{
-    "todo" => MapSet.new(["plan progress"]),
-    "plan progress" => MapSet.new(["plan review", "code progress"]),
-    "plan review" => MapSet.new(["code progress"]),
-    "code progress" => MapSet.new(["plan progress", "code review"]),
-    "code review" => MapSet.new(["rework", "merging", "done"]),
-    "rework" => MapSet.new(["plan progress", "code review"]),
-    "merging" => MapSet.new(["done"])
-  }
+  alias SymphonyElixir.{Config, PullRequestBody, SSH, Workpad}
 
   @issue_context_query """
   query SymphonyIssueGuardContext($issueId: String!) {
@@ -83,22 +64,9 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
             }
           }
         }
-        reviewThreads(first: 100) {
-          nodes {
-            isResolved
-          }
-        }
-        commits(last: 1) {
-          nodes {
-            commit {
-              statusCheckRollup {
-                state
-              }
-            }
-          }
-        }
       }
     }
+  }
   }
   """
 
@@ -168,8 +136,8 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
          {:ok, issue_context} <- fetch_issue_context(linear_client, issue_id),
          {:ok, target_state_name} <- resolve_target_state_name(issue_context, state_id),
          :ok <- ensure_allowed_transition(issue_context, target_state_name),
-         :ok <- maybe_guard_code_review(target_state_name, issue_context, opts) do
-      {:ok, maybe_halt_after_transition(target_state_name)}
+         :ok <- maybe_guard_review_handoff(target_state_name, issue_context, opts) do
+      {:ok, maybe_halt_after_transition(target_state_name, issue_context)}
     end
   end
 
@@ -250,9 +218,6 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
     current_state_name = get_in(issue_context, ["state", "name"])
 
     cond do
-      not workflow_state_machine_enabled?(issue_context) ->
-        :ok
-
       not is_binary(current_state_name) ->
         :ok
 
@@ -260,38 +225,29 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
         :ok
 
       true ->
-        allowed_targets = Map.get(@transition_graph, normalize_state_name(current_state_name), MapSet.new())
+        case transition_distance(issue_context, current_state_name, target_state_name) do
+          {:ok, distance} when abs(distance) == 1 ->
+            :ok
 
-        if MapSet.member?(allowed_targets, normalize_state_name(target_state_name)) do
-          :ok
-        else
-          {:error, {:invalid_issue_state_transition, current_state_name, target_state_name}}
+          {:ok, _distance} ->
+            {:error, {:invalid_issue_state_transition, current_state_name, target_state_name}}
+
+          :error ->
+            :ok
         end
     end
   end
 
-  defp workflow_state_machine_enabled?(issue_context) do
-    state_names =
-      issue_context
-      |> get_in(["team", "states", "nodes"])
-      |> List.wrap()
-      |> Enum.map(&Map.get(&1, "name"))
-      |> Enum.filter(&is_binary/1)
-      |> MapSet.new()
-
-    Enum.all?(@workflow_state_names, &MapSet.member?(state_names, &1))
-  end
-
-  defp maybe_halt_after_transition(target_state_name) do
-    if normalize_state_name(target_state_name) in ["plan review", "code review"] do
+  defp maybe_halt_after_transition(target_state_name, issue_context) do
+    if should_halt_after_transition?(issue_context, target_state_name) do
       %{halt_after_successful_state_transition: target_state_name}
     else
       %{}
     end
   end
 
-  defp maybe_guard_code_review(target_state_name, issue_context, opts) do
-    if normalize_state_name(target_state_name) == "code review" do
+  defp maybe_guard_review_handoff(target_state_name, issue_context, opts) do
+    if review_handoff_transition?(issue_context, target_state_name) do
       guard_code_review(issue_context, opts)
     else
       :ok
@@ -316,8 +272,6 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
          :ok <- ensure_pull_request_ready(pr_details, current_branch, issue_context, workspace_path),
          :ok <- ensure_review_decision_clear(pr_details),
          :ok <- ensure_no_pending_review_requests(pr_details),
-         :ok <- ensure_no_unresolved_reviews(pr_details),
-         :ok <- ensure_pr_checks_green(pr_details),
          :ok <- ensure_comment_based_screenshot_evidence(issue_context) do
       ensure_pr_written_back(issue_context, pr_details, linear_client)
     end
@@ -574,20 +528,6 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
     end
   end
 
-  defp ensure_no_unresolved_reviews(pr_details) do
-    unresolved_threads =
-      pr_details
-      |> get_in(["reviewThreads", "nodes"])
-      |> List.wrap()
-      |> Enum.reject(&(Map.get(&1, "isResolved") == true))
-
-    if unresolved_threads == [] do
-      :ok
-    else
-      {:error, {:unresolved_review_threads, length(unresolved_threads)}}
-    end
-  end
-
   defp ensure_review_decision_clear(pr_details) do
     if Map.get(pr_details, "reviewDecision") == "CHANGES_REQUESTED" do
       {:error, :changes_requested_review_decision}
@@ -607,17 +547,6 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
       :ok
     else
       {:error, {:pending_review_requests, request_count}}
-    end
-  end
-
-  defp ensure_pr_checks_green(pr_details) do
-    check_state =
-      get_in(pr_details, ["commits", "nodes", Access.at(0), "commit", "statusCheckRollup", "state"])
-
-    if check_state == "SUCCESS" do
-      :ok
-    else
-      {:error, {:pull_request_checks_not_green, check_state}}
     end
   end
 
@@ -742,7 +671,7 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
 
   defp ensure_workpad_structure(issue_context, body) do
     case Workpad.validate(body,
-           plan_gate_required: workflow_state_machine_enabled?(issue_context)
+           plan_gate_required: plan_gate_required?(issue_context)
          ) do
       :ok -> :ok
       {:error, errors} -> {:error, {:invalid_workpad_structure, errors}}
@@ -755,8 +684,8 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
     case Regex.named_captures(~r/issueUpdate\s*\((?<args>.*?)\)\s*\{/s, query) do
       %{"args" => args_block} ->
         with {:ok, issue_id} <- extract_argument_value(args_block, "id", variables),
-             {:ok, input_block} <- extract_inline_input(args_block),
-             {:ok, state_id} <- extract_argument_value(input_block, "stateId", variables) do
+             {:ok, input_value} <- extract_issue_update_input(args_block, variables),
+             {:ok, state_id} <- extract_input_field_value(input_value, "stateId", variables) do
           {:ok, %{issue_id: issue_id, state_id: state_id}}
         end
 
@@ -796,10 +725,39 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
     end
   end
 
+  defp extract_issue_update_input(args_block, variables) when is_binary(args_block) and is_map(variables) do
+    case Regex.named_captures(~r/input\s*:\s*(?<value>\$[A-Za-z0-9_]+|\{.*\})\s*$/s, String.trim(args_block)) do
+      %{"value" => "$" <> variable_name} ->
+        case lookup_map_value(variables, variable_name) do
+          value when is_map(value) -> {:ok, value}
+          _ -> {:error, :invalid_issue_update_mutation}
+        end
+
+      %{"value" => value} ->
+        {:ok, value |> String.trim() |> String.trim_leading("{") |> String.trim_trailing("}")}
+
+      _ ->
+        {:error, :invalid_issue_update_mutation}
+    end
+  end
+
+  defp extract_input_field_value(input, argument_name, variables)
+       when is_binary(input) and is_binary(argument_name) and is_map(variables) do
+    extract_argument_value(input, argument_name, variables)
+  end
+
+  defp extract_input_field_value(input, argument_name, _variables)
+       when is_map(input) and is_binary(argument_name) do
+    case lookup_map_value(input, argument_name) do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _ -> {:error, {:missing_mutation_argument, argument_name}}
+    end
+  end
+
   defp extract_argument_value(block, argument_name, variables) do
     case Regex.named_captures(~r/#{Regex.escape(argument_name)}\s*:\s*(?<value>\$[A-Za-z0-9_]+|"(?:[^"\\]|\\.)*")/, block) do
       %{"value" => "$" <> variable_name} ->
-        case Map.get(variables, variable_name) do
+        case lookup_map_value(variables, variable_name) do
           value when is_binary(value) and value != "" -> {:ok, value}
           _ -> {:error, {:missing_mutation_variable, variable_name}}
         end
@@ -810,6 +768,19 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
       _ ->
         {:error, {:missing_mutation_argument, argument_name}}
     end
+  end
+
+  defp lookup_map_value(map, key) when is_map(map) and is_binary(key) do
+    Enum.find_value(map, fn
+      {^key, value} ->
+        value
+
+      {map_key, value} when is_atom(map_key) ->
+        if Atom.to_string(map_key) == key, do: value, else: nil
+
+      _ ->
+        nil
+    end)
   end
 
   defp screenshot_attachment_mutation?(query, variables) do
@@ -891,6 +862,126 @@ defmodule SymphonyElixir.Codex.LinearMutationGuard do
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
   end
+
+  defp transition_distance(issue_context, current_state_name, target_state_name) do
+    with {:ok, current_index} <- state_index(issue_context, current_state_name),
+         {:ok, target_index} <- state_index(issue_context, target_state_name) do
+      {:ok, target_index - current_index}
+    end
+  end
+
+  defp should_halt_after_transition?(issue_context, target_state_name) do
+    not active_state_name?(target_state_name) and not terminal_state?(issue_context, target_state_name)
+  end
+
+  defp review_handoff_transition?(issue_context, target_state_name) do
+    current_state_name = get_in(issue_context, ["state", "name"])
+
+    with true <- is_binary(current_state_name),
+         {:ok, 1} <- transition_distance(issue_context, current_state_name, target_state_name),
+         true <- active_state_name?(current_state_name),
+         false <- active_state_name?(target_state_name),
+         false <- terminal_state?(issue_context, target_state_name),
+         true <- last_active_state?(issue_context, current_state_name) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp plan_gate_required?(issue_context) do
+    states = workflow_states(issue_context)
+
+    case last_active_state_index(states) do
+      nil ->
+        false
+
+      last_active_index ->
+        states
+        |> Enum.with_index()
+        |> Enum.any?(fn {state, index} ->
+          index < last_active_index and not active_state_node?(state) and not completed_state_node?(state)
+        end)
+    end
+  end
+
+  defp last_active_state?(issue_context, state_name) when is_binary(state_name) do
+    case workflow_states(issue_context) |> Enum.filter(&active_state_node?/1) |> List.last() do
+      %{"name" => last_active_name} -> normalize_state_name(last_active_name) == normalize_state_name(state_name)
+      _ -> false
+    end
+  end
+
+  defp last_active_state?(_issue_context, _state_name), do: false
+
+  defp last_active_state_index(states) when is_list(states) do
+    states
+    |> Enum.with_index()
+    |> Enum.reduce(nil, fn
+      {state, index}, acc when is_map(state) ->
+        if active_state_node?(state), do: index, else: acc
+
+      _other, acc ->
+        acc
+    end)
+  end
+
+  defp state_index(issue_context, state_name) when is_binary(state_name) do
+    case Enum.find_index(workflow_states(issue_context), fn
+           %{"name" => candidate_name} when is_binary(candidate_name) ->
+             normalize_state_name(candidate_name) == normalize_state_name(state_name)
+
+           _ ->
+             false
+         end) do
+      nil -> :error
+      index -> {:ok, index}
+    end
+  end
+
+  defp state_index(_issue_context, _state_name), do: :error
+
+  defp workflow_states(issue_context) do
+    issue_context
+    |> get_in(["team", "states", "nodes"])
+    |> List.wrap()
+  end
+
+  defp active_state_name?(state_name) when is_binary(state_name) do
+    Config.settings!().tracker.active_states
+    |> Enum.any?(fn candidate -> normalize_state_name(candidate) == normalize_state_name(state_name) end)
+  end
+
+  defp active_state_name?(_state_name), do: false
+
+  defp terminal_state_name?(state_name) when is_binary(state_name) do
+    Config.settings!().tracker.terminal_states
+    |> Enum.any?(fn candidate -> normalize_state_name(candidate) == normalize_state_name(state_name) end)
+  end
+
+  defp terminal_state_name?(_state_name), do: false
+
+  defp terminal_state?(issue_context, state_name) do
+    terminal_state_name?(state_name) or completed_state?(issue_context, state_name)
+  end
+
+  defp completed_state?(issue_context, state_name) when is_binary(state_name) do
+    Enum.any?(workflow_states(issue_context), fn
+      %{"name" => candidate_name, "type" => "completed"} when is_binary(candidate_name) ->
+        normalize_state_name(candidate_name) == normalize_state_name(state_name)
+
+      _ ->
+        false
+    end)
+  end
+
+  defp completed_state?(_issue_context, _state_name), do: false
+
+  defp active_state_node?(%{"name" => state_name}) when is_binary(state_name), do: active_state_name?(state_name)
+  defp active_state_node?(_state), do: false
+
+  defp completed_state_node?(%{"type" => "completed"}), do: true
+  defp completed_state_node?(_state), do: false
 
   defp normalize_state_name(state_name) when is_binary(state_name) do
     state_name

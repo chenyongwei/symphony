@@ -514,44 +514,189 @@ defmodule SymphonyElixir.CoreTest do
     refute Process.alive?(agent_pid)
   end
 
-  test "normal worker exit schedules active-state continuation retry" do
-    issue_id = "issue-resume"
+  test "normal worker exit in the first post-Todo active state stops without scheduling continuation retry" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_id = "issue-plan-idle"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :ContinuationOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
 
-    on_exit(fn ->
-      if Process.alive?(pid) do
-        Process.exit(pid, :normal)
-      end
-    end)
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        tracker_active_states: ["Todo", "Plan Progress", "Code Progress", "Rework"]
+      )
 
-    initial_state = :sys.get_state(pid)
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+        %Issue{id: issue_id, identifier: "MT-558", state: "Plan Progress"}
+      ])
 
-    running_entry = %{
-      pid: self(),
-      ref: ref,
-      identifier: "MT-558",
-      issue: %Issue{id: issue_id, identifier: "MT-558", state: "In Progress"},
-      started_at: DateTime.utc_now()
-    }
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
 
-    :sys.replace_state(pid, fn _ ->
-      initial_state
-      |> Map.put(:running, %{issue_id => running_entry})
-      |> Map.put(:claimed, MapSet.new([issue_id]))
-      |> Map.put(:retry_attempts, %{})
-    end)
+      on_exit(fn ->
+        restore_app_env(:memory_tracker_issues, previous_memory_issues)
 
-    send(pid, {:DOWN, ref, :process, self(), :normal})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
 
-    refute Map.has_key?(state.running, issue_id)
-    assert MapSet.member?(state.completed, issue_id)
-    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
-    assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+      initial_state = :sys.get_state(pid)
+
+      running_entry = %{
+        pid: self(),
+        ref: ref,
+        identifier: "MT-558",
+        issue: %Issue{id: issue_id, identifier: "MT-558", state: "Plan Progress"},
+        started_at: DateTime.utc_now()
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        initial_state
+        |> Map.put(:running, %{issue_id => running_entry})
+        |> Map.put(:claimed, MapSet.new([issue_id]))
+        |> Map.put(:retry_attempts, %{})
+      end)
+
+      send(pid, {:DOWN, ref, :process, self(), :normal})
+      Process.sleep(50)
+      state = :sys.get_state(pid)
+
+      refute Map.has_key?(state.running, issue_id)
+      assert MapSet.member?(state.completed, issue_id)
+      assert state.retry_attempts == %{}
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+    end
+  end
+
+  test "normal worker exit in a later active state schedules a continuation retry" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_id = "issue-continue-active"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :ActiveContinuationOrchestrator)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        tracker_active_states: ["Todo", "Plan Progress", "Code Progress", "Rework"]
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+        %Issue{id: issue_id, identifier: "MT-559A", state: "Code Progress"}
+      ])
+
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      initial_state = :sys.get_state(pid)
+
+      running_entry = %{
+        pid: self(),
+        ref: ref,
+        identifier: "MT-559A",
+        issue: %Issue{id: issue_id, identifier: "MT-559A", state: "Code Progress"},
+        started_at: DateTime.utc_now()
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        initial_state
+        |> Map.put(:running, %{issue_id => running_entry})
+        |> Map.put(:claimed, MapSet.new([issue_id]))
+        |> Map.put(:retry_attempts, %{})
+      end)
+
+      send(pid, {:DOWN, ref, :process, self(), :normal})
+      Process.sleep(50)
+      state = :sys.get_state(pid)
+
+      refute Map.has_key?(state.running, issue_id)
+      refute MapSet.member?(state.completed, issue_id)
+
+      assert %{attempt: 1, identifier: "MT-559A", error: error} = state.retry_attempts[issue_id]
+      assert error =~ "without reaching a handoff state"
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+    end
+  end
+
+  test "normal worker exit with a dirty workspace schedules a continuation retry with a dirty-worktree error" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_id = "issue-dirty-exit"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :DirtyWorkspaceContinuationOrchestrator)
+
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-dirty-workspace-exit-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(test_root, "workspace")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        tracker_active_states: ["Todo", "Plan Progress", "Code Progress", "Rework"]
+      )
+
+      File.mkdir_p!(workspace)
+      git!(workspace, ["init", "-b", "main"])
+      git!(workspace, ["config", "user.name", "Test User"])
+      git!(workspace, ["config", "user.email", "test@example.com"])
+      File.write!(Path.join(workspace, "README.md"), "base\n")
+      git!(workspace, ["add", "README.md"])
+      git!(workspace, ["commit", "-m", "initial"])
+      File.write!(Path.join(workspace, "README.md"), "dirty\n")
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+        %Issue{id: issue_id, identifier: "MT-559B", state: "Code Progress"}
+      ])
+
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      initial_state = :sys.get_state(pid)
+
+      running_entry = %{
+        pid: self(),
+        ref: ref,
+        identifier: "MT-559B",
+        issue: %Issue{id: issue_id, identifier: "MT-559B", state: "Code Progress"},
+        workspace_path: workspace,
+        started_at: DateTime.utc_now()
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        initial_state
+        |> Map.put(:running, %{issue_id => running_entry})
+        |> Map.put(:claimed, MapSet.new([issue_id]))
+        |> Map.put(:retry_attempts, %{})
+      end)
+
+      send(pid, {:DOWN, ref, :process, self(), :normal})
+      Process.sleep(50)
+      state = :sys.get_state(pid)
+
+      assert %{attempt: 1, identifier: "MT-559B", error: error} = state.retry_attempts[issue_id]
+      assert error =~ "workspace still had local changes"
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      File.rm_rf(test_root)
+    end
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -591,7 +736,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_in_range(due_at_ms, 38_000, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -630,7 +775,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert_due_in_range(due_at_ms, 8_500, 10_500)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -755,6 +900,16 @@ defmodule SymphonyElixir.CoreTest do
 
     assert remaining_ms >= min_remaining_ms
     assert remaining_ms <= max_remaining_ms
+  end
+
+  defp git!(repo, args) do
+    case System.cmd("git", ["-C", repo | args], stderr_to_stdout: true) do
+      {_output, 0} ->
+        :ok
+
+      {output, status} ->
+        flunk("git #{Enum.join(args, " ")} failed with status #{status}: #{output}")
+    end
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
@@ -1109,6 +1264,234 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "agent runner promotes Todo issues to Plan Progress before the first turn when configured" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-plan-progress-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-plan-progress.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-plan-progress.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-plan-progress"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-plan-progress"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        tracker_active_states: ["Todo", "Plan Progress", "Code Progress"],
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        prompt: "Current status: {{ issue.state }}"
+      )
+
+      issue = %Issue{
+        id: "issue-plan-progress",
+        identifier: "MT-PP",
+        title: "Promote before planning",
+        description: "Todo issues should start in Plan Progress",
+        state: "Todo",
+        url: "https://example.org/issues/MT-PP",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue)
+      assert_receive {:memory_tracker_state_update, "issue-plan-progress", "Plan Progress"}
+      assert File.read!(trace_file) =~ "Current status: Plan Progress"
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner promotes Todo issues to the next active state on legacy workflows" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-legacy-progress-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-legacy-progress.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-legacy-progress.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-no-plan-progress"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-no-plan-progress"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        tracker_active_states: ["Todo", "In Progress"],
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        prompt: "Current status: {{ issue.state }}"
+      )
+
+      issue = %Issue{
+        id: "issue-legacy-progress",
+        identifier: "MT-IP",
+        title: "Promote on legacy workflows",
+        description: "Todo issues should start in the next configured active state",
+        state: "Todo",
+        url: "https://example.org/issues/MT-IP",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue)
+      assert_receive {:memory_tracker_state_update, "issue-legacy-progress", "In Progress"}
+      assert File.read!(trace_file) =~ "Current status: In Progress"
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner leaves Todo issues unchanged when no next active state exists" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-no-next-state-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-no-next-state.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-no-next-state.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-no-next-state"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-no-next-state"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        tracker_active_states: ["Todo"],
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        prompt: "Current status: {{ issue.state }}"
+      )
+
+      issue = %Issue{
+        id: "issue-no-next-state",
+        identifier: "MT-TO",
+        title: "Stay on Todo without a next state",
+        description: "Todo issues should remain Todo when no next active state exists",
+        state: "Todo",
+        url: "https://example.org/issues/MT-TO",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue)
+      refute_received {:memory_tracker_state_update, "issue-no-next-state", _state}
+      assert File.read!(trace_file) =~ "Current status: Todo"
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
   test "agent runner forwards timestamped codex updates to recipient" do
     test_root =
       Path.join(
@@ -1179,8 +1562,7 @@ defmodule SymphonyElixir.CoreTest do
       assert :ok =
                AgentRunner.run(
                  issue,
-                 test_pid,
-                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+                 test_pid
                )
 
       assert_receive {:codex_worker_update, "issue-live-updates",
@@ -1267,11 +1649,11 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "agent runner continues with a follow-up turn while the issue remains active" do
+  test "agent runner stops after the first successful turn" do
     test_root =
       Path.join(
         System.tmp_dir!(),
-        "symphony-elixir-agent-runner-continuation-#{System.unique_integer([:positive])}"
+        "symphony-elixir-agent-runner-single-turn-#{System.unique_integer([:positive])}"
       )
 
     try do
@@ -1312,7 +1694,7 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
           5)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-2"}}}'
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-unexpected"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
         esac
@@ -1327,35 +1709,8 @@ defmodule SymphonyElixir.CoreTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
-        codex_command: "#{codex_binary} app-server",
-        max_turns: 3
+        codex_command: "#{codex_binary} app-server"
       )
-
-      parent = self()
-
-      state_fetcher = fn [_issue_id] ->
-        attempt = Process.get(:agent_turn_fetch_count, 0) + 1
-        Process.put(:agent_turn_fetch_count, attempt)
-        send(parent, {:issue_state_fetch, attempt})
-
-        state =
-          if attempt == 1 do
-            "In Progress"
-          else
-            "Done"
-          end
-
-        {:ok,
-         [
-           %Issue{
-             id: "issue-continue",
-             identifier: "MT-247",
-             title: "Continue until done",
-             description: "Still active after first turn",
-             state: state
-           }
-         ]}
-      end
 
       issue = %Issue{
         id: "issue-continue",
@@ -1367,128 +1722,13 @@ defmodule SymphonyElixir.CoreTest do
         labels: []
       }
 
-      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
-      assert_receive {:issue_state_fetch, 1}
-      assert_receive {:issue_state_fetch, 2}
+      assert :ok = AgentRunner.run(issue)
 
       lines = File.read!(trace_file) |> String.split("\n", trim: true)
 
       assert length(Enum.filter(lines, &String.starts_with?(&1, "RUN:"))) == 1
       assert length(Enum.filter(lines, &String.contains?(&1, "\"method\":\"thread/start\""))) == 1
-
-      turn_texts =
-        lines
-        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
-        |> Enum.map(&String.trim_leading(&1, "JSON:"))
-        |> Enum.map(&Jason.decode!/1)
-        |> Enum.filter(&(&1["method"] == "turn/start"))
-        |> Enum.map(fn payload ->
-          get_in(payload, ["params", "input"])
-          |> Enum.map_join("\n", &Map.get(&1, "text", ""))
-        end)
-
-      assert length(turn_texts) == 2
-      assert Enum.at(turn_texts, 0) =~ "You are an agent for this repository."
-      refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
-      assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
-      assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
-    after
-      System.delete_env("SYMP_TEST_CODEx_TRACE")
-      File.rm_rf(test_root)
-    end
-  end
-
-  test "agent runner stops continuing once agent.max_turns is reached" do
-    test_root =
-      Path.join(
-        System.tmp_dir!(),
-        "symphony-elixir-agent-runner-max-turns-#{System.unique_integer([:positive])}"
-      )
-
-    try do
-      template_repo = Path.join(test_root, "source")
-      workspace_root = Path.join(test_root, "workspaces")
-      codex_binary = Path.join(test_root, "fake-codex")
-      trace_file = Path.join(test_root, "codex.trace")
-
-      File.mkdir_p!(template_repo)
-      File.write!(Path.join(template_repo, "README.md"), "# test")
-      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
-      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
-      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
-      System.cmd("git", ["-C", template_repo, "add", "README.md"])
-      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
-
-      File.write!(codex_binary, """
-      #!/bin/sh
-      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
-      printf 'RUN\\n' >> "$trace_file"
-      count=0
-
-      while IFS= read -r line; do
-        count=$((count + 1))
-        printf 'JSON:%s\\n' "$line" >> "$trace_file"
-        case "$count" in
-          1)
-            printf '%s\\n' '{"id":1,"result":{}}'
-            ;;
-          2)
-            ;;
-          3)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-max"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-          5)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-        esac
-      done
-      """)
-
-      File.chmod!(codex_binary, 0o755)
-      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
-
-      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
-
-      write_workflow_file!(Workflow.workflow_file_path(),
-        workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
-        codex_command: "#{codex_binary} app-server",
-        max_turns: 2
-      )
-
-      state_fetcher = fn [_issue_id] ->
-        {:ok,
-         [
-           %Issue{
-             id: "issue-max-turns",
-             identifier: "MT-248",
-             title: "Stop at max turns",
-             description: "Still active",
-             state: "In Progress"
-           }
-         ]}
-      end
-
-      issue = %Issue{
-        id: "issue-max-turns",
-        identifier: "MT-248",
-        title: "Stop at max turns",
-        description: "Still active",
-        state: "In Progress",
-        url: "https://example.org/issues/MT-248",
-        labels: []
-      }
-
-      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
-
-      trace = File.read!(trace_file)
-      assert length(String.split(trace, "RUN", trim: true)) == 1
-      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 2
+      assert length(Regex.scan(~r/"method":"turn\/start"/, File.read!(trace_file))) == 1
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)

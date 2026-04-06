@@ -1124,6 +1124,30 @@ defmodule SymphonyElixir.StatusDashboard do
     if is_binary(decision), do: "#{base}: #{decision}", else: base
   end
 
+  defp humanize_codex_event(:approval_auto_denied, message, payload) do
+    method =
+      map_value(payload, ["method", :method]) ||
+        map_path(message, ["payload", "method"]) ||
+        map_path(message, [:payload, :method])
+
+    decision = map_value(message, ["decision", :decision])
+    reason = map_value(message, ["reason", :reason])
+
+    base =
+      if is_binary(method) do
+        "#{humanize_codex_method(method, payload)} (auto-denied)"
+      else
+        "approval request auto-denied"
+      end
+
+    suffix =
+      [decision, reason]
+      |> Enum.filter(&is_binary/1)
+      |> Enum.join(": ")
+
+    if suffix == "", do: base, else: "#{base}: #{suffix}"
+  end
+
   defp humanize_codex_event(:tool_input_auto_answered, message, payload) do
     answer = map_value(message, ["answer", :answer])
 

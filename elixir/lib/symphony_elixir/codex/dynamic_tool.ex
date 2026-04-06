@@ -222,7 +222,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload(:open_pull_request_required) do
     %{
       "error" => %{
-        "message" => "Symphony blocks `Code Review` until the current `feature/*` branch has an open pull request."
+        "message" => "Symphony blocks final review handoff until the current `feature/*` branch has an open pull request."
       }
     }
   end
@@ -230,7 +230,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload(:draft_pull_request_not_reviewable) do
     %{
       "error" => %{
-        "message" => "Symphony blocks `Code Review` while the pull request is still a draft."
+        "message" => "Symphony blocks final review handoff while the pull request is still a draft."
       }
     }
   end
@@ -287,7 +287,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload({:screenshot_attachments_disallowed, count}) do
     %{
       "error" => %{
-        "message" => "Symphony blocks `Code Review` while screenshot evidence is still attached as issue attachments. Move it into Linear comments instead.",
+        "message" => "Symphony blocks final review handoff while screenshot evidence is still attached as issue attachments. Move it into Linear comments instead.",
         "attachmentCount" => count
       }
     }
@@ -316,7 +316,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload({:invalid_feature_branch, branch}) do
     %{
       "error" => %{
-        "message" => "Symphony requires work to stay on a `feature/*` branch before entering `Code Review`.",
+        "message" => "Symphony requires work to stay on a `feature/*` branch before final review handoff.",
         "branch" => branch
       }
     }
@@ -325,7 +325,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload({:unexpected_issue_branch, branch, expected_branch}) do
     %{
       "error" => %{
-        "message" => "Symphony requires each issue to use its dedicated feature branch before entering `Code Review`.",
+        "message" => "Symphony requires each issue to use its dedicated feature branch before final review handoff.",
         "branch" => branch,
         "expectedBranch" => expected_branch
       }
@@ -335,7 +335,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload({:pull_request_not_open, state}) do
     %{
       "error" => %{
-        "message" => "Symphony blocks `Code Review` unless the pull request is open.",
+        "message" => "Symphony blocks final review handoff unless the pull request is open.",
         "pullRequestState" => state
       }
     }
@@ -344,7 +344,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload({:pull_request_branch_mismatch, pr_branch, current_branch}) do
     %{
       "error" => %{
-        "message" => "Symphony blocks `Code Review` when the pull request branch does not match the current workspace branch.",
+        "message" => "Symphony blocks final review handoff when the pull request branch does not match the current workspace branch.",
         "pullRequestBranch" => pr_branch,
         "currentBranch" => current_branch
       }
@@ -354,7 +354,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload({:pull_request_title_prefix_missing, identifier, title}) do
     %{
       "error" => %{
-        "message" => "Symphony requires PR titles to start with the Linear identifier prefix before entering `Code Review`.",
+        "message" => "Symphony requires PR titles to start with the Linear identifier prefix before final review handoff.",
         "expectedPrefix" => "#{identifier}:",
         "title" => title
       }
@@ -364,27 +364,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload({:pull_request_body_invalid, template_path, errors}) do
     %{
       "error" => %{
-        "message" => "Symphony requires the PR body to match the repository template before entering `Code Review`.",
+        "message" => "Symphony requires the PR body to match the repository template before final review handoff.",
         "templatePath" => template_path,
         "errors" => errors
-      }
-    }
-  end
-
-  defp tool_error_payload({:unresolved_review_threads, count}) do
-    %{
-      "error" => %{
-        "message" => "Symphony blocks `Code Review` while PR review threads are still unresolved.",
-        "unresolvedThreadCount" => count
-      }
-    }
-  end
-
-  defp tool_error_payload({:pull_request_checks_not_green, state}) do
-    %{
-      "error" => %{
-        "message" => "Symphony blocks `Code Review` until pull request checks are green.",
-        "statusCheckState" => state
       }
     }
   end
@@ -392,7 +374,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload(:changes_requested_review_decision) do
     %{
       "error" => %{
-        "message" => "Symphony blocks `Code Review` while the pull request review decision is still `CHANGES_REQUESTED`."
+        "message" => "Symphony blocks final review handoff while the pull request review decision is still `CHANGES_REQUESTED`."
       }
     }
   end
@@ -400,7 +382,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload({:pending_review_requests, count}) do
     %{
       "error" => %{
-        "message" => "Symphony blocks `Code Review` while the pull request still has pending review requests.",
+        "message" => "Symphony blocks final review handoff while the pull request still has pending review requests.",
         "pendingReviewRequestCount" => count
       }
     }
@@ -409,7 +391,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload(:missing_workspace_context) do
     %{
       "error" => %{
-        "message" => "Symphony could not determine the workspace for this run, so Code Review guards could not execute."
+        "message" => "Symphony could not determine the workspace for this run, so final review guards could not execute."
       }
     }
   end
@@ -433,7 +415,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload({:workspace_not_clean, output}) do
     %{
       "error" => %{
-        "message" => "Symphony blocks `Code Review` while the workspace has tracked local changes.",
+        "message" => "Symphony blocks final review handoff while the workspace has tracked local changes.",
         "status" => String.trim(output)
       }
     }
@@ -442,7 +424,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload({:pull_request_branch_not_pushed, branch}) do
     %{
       "error" => %{
-        "message" => "Symphony blocks `Code Review` until the feature branch exists on `origin`.",
+        "message" => "Symphony blocks final review handoff until the feature branch exists on `origin`.",
         "branch" => branch
       }
     }
@@ -451,7 +433,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload({:branch_not_pushed, branch, local_head, remote_head}) do
     %{
       "error" => %{
-        "message" => "Symphony blocks `Code Review` until the current local commit is pushed to `origin`.",
+        "message" => "Symphony blocks final review handoff until the current local commit is pushed to `origin`.",
         "branch" => branch,
         "localHead" => local_head,
         "remoteHead" => remote_head
@@ -462,7 +444,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload({:branch_behind_integration, integration_branch}) do
     %{
       "error" => %{
-        "message" => "Symphony blocks `Code Review` until the branch contains the latest integration branch.",
+        "message" => "Symphony blocks final review handoff until the branch contains the latest integration branch.",
         "integrationBranch" => integration_branch
       }
     }

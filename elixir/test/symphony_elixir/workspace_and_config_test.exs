@@ -1395,8 +1395,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert :ok =
                AgentRunner.run(
                  issue,
-                 nil,
-                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+                 nil
                )
 
       synced_head =

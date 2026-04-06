@@ -49,6 +49,44 @@ defmodule Mix.Tasks.PrBody.CheckTest do
   - [x] Ran targeted checks.
   """
 
+  @mixed_level_template """
+  # Summary
+  ## Summary
+
+  - What changed?
+  - Why was this change needed?
+
+  # Scope
+  ## Scope
+
+  - Which areas are affected?
+
+  # Verification
+  ## Verification
+
+  - [ ] Self-review completed
+  - [ ] Relevant tests or checks were run
+  """
+
+  @mixed_level_valid_body """
+  # Summary
+  ## Summary
+
+  - Added industry pack defaults.
+  - Needed to bootstrap the feature.
+
+  # Scope
+  ## Scope
+
+  - Impacts the sheet-metal pack initialization path.
+
+  # Verification
+  ## Verification
+
+  - [x] Self-review completed
+  - [x] mix test
+  """
+
   setup do
     Mix.Task.reenable("pr_body.check")
     :ok
@@ -306,6 +344,20 @@ defmodule Mix.Tasks.PrBody.CheckTest do
     in_temp_repo(fn ->
       write_template!(@template)
       File.write!("body.md", @valid_body)
+
+      output =
+        capture_io(fn ->
+          Check.run(["lint", "--file", "body.md"])
+        end)
+
+      assert output =~ "PR body format OK"
+    end)
+  end
+
+  test "passes for templates that use h1 and h2 headings" do
+    in_temp_repo(fn ->
+      write_template!(@mixed_level_template)
+      File.write!("body.md", @mixed_level_valid_body)
 
       output =
         capture_io(fn ->

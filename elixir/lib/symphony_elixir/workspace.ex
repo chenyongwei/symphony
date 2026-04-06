@@ -308,6 +308,51 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @spec worktree_dirty?(Path.t(), worker_host()) :: {:ok, boolean()} | {:error, term()}
+  def worktree_dirty?(workspace, worker_host \\ nil)
+
+  def worktree_dirty?(workspace, nil) when is_binary(workspace) do
+    case System.cmd("sh", ["-lc", worktree_dirty_script()], cd: workspace, stderr_to_stdout: true) do
+      {output, 0} ->
+        {:ok, String.trim(output) == "dirty"}
+
+      {output, status} ->
+        sanitized_output = sanitize_hook_output_for_log(output)
+
+        Logger.warning("Workspace worktree check failed workspace=#{workspace} worker_host=local status=#{status} output=#{inspect(sanitized_output)}")
+
+        {:error, {:workspace_worktree_check_failed, status, output}}
+    end
+  end
+
+  def worktree_dirty?(workspace, worker_host) when is_binary(workspace) and is_binary(worker_host) do
+    script =
+      [
+        remote_shell_assign("workspace", workspace),
+        "cd \"$workspace\"",
+        worktree_dirty_script()
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {output, 0}} ->
+        {:ok, String.trim(output) == "dirty"}
+
+      {:ok, {output, status}} ->
+        sanitized_output = sanitize_hook_output_for_log(output)
+
+        Logger.warning("Workspace worktree check failed workspace=#{workspace} worker_host=#{worker_host} status=#{status} output=#{inspect(sanitized_output)}")
+
+        {:error, {:workspace_worktree_check_failed, status, output}}
+
+      {:error, {:workspace_hook_timeout, "remote_command", timeout_ms}} ->
+        {:error, {:workspace_worktree_check_timeout, timeout_ms}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   defp workspace_path_for_issue(safe_id, nil) when is_binary(safe_id) do
     Config.settings!().workspace.root
     |> Path.join(safe_id)
@@ -487,6 +532,22 @@ defmodule SymphonyElixir.Workspace do
         exit 23
         ;;
     esac
+    """
+  end
+
+  defp worktree_dirty_script do
+    """
+    set -eu
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      printf 'clean'
+      exit 0
+    fi
+
+    if [ -n "$(git status --porcelain)" ]; then
+      printf 'dirty'
+    else
+      printf 'clean'
+    fi
     """
   end
 

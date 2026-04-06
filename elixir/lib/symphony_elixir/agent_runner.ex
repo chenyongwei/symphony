@@ -36,6 +36,7 @@ defmodule SymphonyElixir.AgentRunner do
         try do
           with :ok <- Workspace.sync_integration_branch(workspace, worker_host),
                :ok <- Workspace.ensure_issue_feature_branch(workspace, issue, worker_host),
+               {:ok, issue} <- maybe_promote_todo_issue(issue),
                :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
             run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
           end
@@ -79,20 +80,17 @@ defmodule SymphonyElixir.AgentRunner do
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
-    max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
-    issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
-
     with {:ok, session} <- AppServer.start_session(workspace, issue: issue, worker_host: worker_host) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        do_run_codex_turn(session, workspace, issue, codex_update_recipient, opts)
       after
         AppServer.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+  defp do_run_codex_turn(app_session, workspace, issue, codex_update_recipient, opts) do
+    prompt = PromptBuilder.build_prompt(issue, opts)
 
     with {:ok, turn_session} <-
            AppServer.run_turn(
@@ -101,78 +99,10 @@ defmodule SymphonyElixir.AgentRunner do
              issue,
              on_message: codex_message_handler(codex_update_recipient, issue)
            ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
-
-      case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
-
-          do_run_codex_turns(
-            app_session,
-            workspace,
-            refreshed_issue,
-            codex_update_recipient,
-            opts,
-            issue_state_fetcher,
-            turn_number + 1,
-            max_turns
-          )
-
-        {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
-
-          :ok
-
-        {:done, _refreshed_issue} ->
-          :ok
-
-        {:error, reason} ->
-          {:error, reason}
-      end
+      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace}")
+      :ok
     end
   end
-
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
-
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
-    """
-    Continuation guidance:
-
-    - The previous Codex turn completed normally, but the Linear issue is still in an active state.
-    - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
-    - Resume from the current workspace and workpad state instead of restarting from scratch.
-    - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
-    - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
-    """
-  end
-
-  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
-    case issue_state_fetcher.([issue_id]) do
-      {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if active_issue_state?(refreshed_issue.state) do
-          {:continue, refreshed_issue}
-        else
-          {:done, refreshed_issue}
-        end
-
-      {:ok, []} ->
-        {:done, issue}
-
-      {:error, reason} ->
-        {:error, {:issue_state_refresh_failed, reason}}
-    end
-  end
-
-  defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
-
-  defp active_issue_state?(state_name) when is_binary(state_name) do
-    normalized_state = normalize_issue_state(state_name)
-
-    Config.settings!().tracker.active_states
-    |> Enum.any?(fn active_state -> normalize_issue_state(active_state) == normalized_state end)
-  end
-
-  defp active_issue_state?(_state_name), do: false
 
   defp selected_worker_host(nil, []), do: nil
 
@@ -193,11 +123,38 @@ defmodule SymphonyElixir.AgentRunner do
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
 
-  defp normalize_issue_state(state_name) when is_binary(state_name) do
-    state_name
-    |> String.trim()
-    |> String.downcase()
+  defp maybe_promote_todo_issue(%Issue{} = issue) do
+    case next_state_after_todo(issue) do
+      {:ok, next_state} ->
+        Logger.info("Promoting issue to #{next_state} before run #{issue_context(issue)}")
+
+        case Tracker.update_issue_state(issue.id, next_state) do
+          :ok ->
+            {:ok, %{issue | state: next_state}}
+
+          {:error, reason} ->
+            {:error, {:issue_state_transition_failed, next_state, reason}}
+        end
+
+      :noop ->
+        {:ok, issue}
+    end
   end
+
+  defp maybe_promote_todo_issue(issue), do: {:ok, issue}
+
+  defp next_state_after_todo(%Issue{id: issue_id, state: "Todo"}) when is_binary(issue_id) do
+    Config.settings!().tracker.active_states
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> find_next_state_after_todo()
+  end
+
+  defp next_state_after_todo(_issue), do: :noop
+
+  defp find_next_state_after_todo(["Todo", next_state | _rest]), do: {:ok, next_state}
+  defp find_next_state_after_todo([_state | rest]), do: find_next_state_after_todo(rest)
+  defp find_next_state_after_todo([]), do: :noop
 
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"

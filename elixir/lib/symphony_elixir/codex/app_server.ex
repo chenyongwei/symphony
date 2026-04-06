@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Codex.WorkflowPhase, Config, PathSafety, SSH}
 
   @initialize_id 1
   @thread_start_id 2
@@ -25,6 +25,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           workspace: Path.t(),
           worker_host: String.t() | nil
         }
+
+  @type phase_policy :: WorkflowPhase.policy()
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
@@ -96,6 +98,14 @@ defmodule SymphonyElixir.Codex.AppServer do
         )
       end)
 
+    phase_policy =
+      Keyword.get_lazy(opts, :phase_policy, fn ->
+        WorkflowPhase.current(issue,
+          issue_context: Keyword.get(opts, :issue_context),
+          linear_client: Keyword.get(opts, :linear_client, &SymphonyElixir.Linear.Client.graphql/3)
+        )
+      end)
+
     case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
@@ -112,7 +122,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests, phase_policy) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -334,22 +344,23 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, phase_policy) do
     receive_loop(
       port,
       on_message,
       Config.settings!().codex.turn_timeout_ms,
       "",
       tool_executor,
-      auto_approve_requests
+      auto_approve_requests,
+      phase_policy
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, phase_policy) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests, phase_policy)
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -358,7 +369,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           pending_line <> to_string(chunk),
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          phase_policy
         )
 
       {^port, {:exit_status, status}} ->
@@ -369,7 +381,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests, phase_policy) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
@@ -411,7 +423,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           method,
           timeout_ms,
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          phase_policy
         )
 
       {:ok, payload} ->
@@ -425,7 +438,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, phase_policy)
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -442,7 +455,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, phase_policy)
     end
   end
 
@@ -467,7 +480,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          method,
          timeout_ms,
          tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         phase_policy
        ) do
     metadata = metadata_from_message(port, payload)
 
@@ -479,7 +493,8 @@ defmodule SymphonyElixir.Codex.AppServer do
            on_message,
            metadata,
            tool_executor,
-           auto_approve_requests
+           auto_approve_requests,
+           phase_policy
          ) do
       :input_required ->
         emit_message(
@@ -492,7 +507,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, phase_policy)
 
       {:halt_turn, halt_reason} ->
         emit_message(
@@ -536,7 +551,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, phase_policy)
         end
     end
   end
@@ -549,17 +564,18 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         phase_policy
        ) do
-    approve_or_require(
+    maybe_restrict_command_execution(
       port,
       id,
-      "acceptForSession",
       payload,
       payload_string,
       on_message,
       metadata,
-      auto_approve_requests
+      auto_approve_requests,
+      phase_policy
     )
   end
 
@@ -571,7 +587,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          tool_executor,
-         _auto_approve_requests
+         _auto_approve_requests,
+         _phase_policy
        ) do
     tool_name = tool_call_name(params)
     arguments = tool_call_arguments(params)
@@ -611,17 +628,18 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         phase_policy
        ) do
-    approve_or_require(
+    maybe_restrict_command_execution(
       port,
       id,
-      "approved_for_session",
       payload,
       payload_string,
       on_message,
       metadata,
-      auto_approve_requests
+      auto_approve_requests,
+      phase_policy
     )
   end
 
@@ -633,17 +651,18 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         phase_policy
        ) do
-    approve_or_require(
+    maybe_restrict_file_writes(
       port,
       id,
-      "approved_for_session",
       payload,
       payload_string,
       on_message,
       metadata,
-      auto_approve_requests
+      auto_approve_requests,
+      phase_policy
     )
   end
 
@@ -655,17 +674,18 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         phase_policy
        ) do
-    approve_or_require(
+    maybe_restrict_file_writes(
       port,
       id,
-      "acceptForSession",
       payload,
       payload_string,
       on_message,
       metadata,
-      auto_approve_requests
+      auto_approve_requests,
+      phase_policy
     )
   end
 
@@ -677,7 +697,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         _phase_policy
        ) do
     maybe_auto_answer_tool_request_user_input(
       port,
@@ -699,10 +720,149 @@ defmodule SymphonyElixir.Codex.AppServer do
          _on_message,
          _metadata,
          _tool_executor,
-         _auto_approve_requests
+         _auto_approve_requests,
+         _phase_policy
        ) do
     :unhandled
   end
+
+  defp maybe_restrict_command_execution(
+         port,
+         id,
+         payload,
+         payload_string,
+         on_message,
+         metadata,
+         auto_approve_requests,
+         phase_policy
+       ) do
+    case planning_command_decision(payload, phase_policy) do
+      {:decline, reason} ->
+        reply_to_approval_request(
+          port,
+          id,
+          planning_decline_decision(payload),
+          payload,
+          payload_string,
+          on_message,
+          metadata,
+          reason
+        )
+
+      :allow ->
+        approve_or_require(
+          port,
+          id,
+          approval_accept_decision(payload),
+          payload,
+          payload_string,
+          on_message,
+          metadata,
+          auto_approve_requests
+        )
+    end
+  end
+
+  defp maybe_restrict_file_writes(
+         port,
+         id,
+         payload,
+         payload_string,
+         on_message,
+         metadata,
+         auto_approve_requests,
+         phase_policy
+       ) do
+    if WorkflowPhase.planning_restricted?(phase_policy) do
+      reply_to_approval_request(
+        port,
+        id,
+        planning_decline_decision(payload),
+        payload,
+        payload_string,
+        on_message,
+        metadata,
+        "planning-phase write blocked"
+      )
+    else
+      approve_or_require(
+        port,
+        id,
+        approval_accept_decision(payload),
+        payload,
+        payload_string,
+        on_message,
+        metadata,
+        auto_approve_requests
+      )
+    end
+  end
+
+  defp planning_command_decision(payload, phase_policy) do
+    if WorkflowPhase.planning_restricted?(phase_policy) and
+         not planning_safe_command?(extract_command(payload)) do
+      {:decline, "planning-phase command blocked"}
+    else
+      :allow
+    end
+  end
+
+  defp reply_to_approval_request(port, id, decision, payload, payload_string, on_message, metadata, reason) do
+    send_message(port, %{"id" => id, "result" => %{"decision" => decision}})
+
+    emit_message(
+      on_message,
+      :approval_auto_denied,
+      %{payload: payload, raw: payload_string, decision: decision, reason: reason},
+      metadata
+    )
+
+    :approved
+  end
+
+  defp approval_accept_decision(%{"method" => "item/commandExecution/requestApproval"}), do: "acceptForSession"
+  defp approval_accept_decision(%{"method" => "item/fileChange/requestApproval"}), do: "acceptForSession"
+  defp approval_accept_decision(_payload), do: "approved_for_session"
+
+  defp planning_decline_decision(%{"method" => "item/commandExecution/requestApproval"}), do: "deny"
+  defp planning_decline_decision(%{"method" => "item/fileChange/requestApproval"}), do: "deny"
+  defp planning_decline_decision(_payload), do: "decline"
+
+  defp planning_safe_command?(command) when is_binary(command) do
+    trimmed = String.trim(command)
+
+    cond do
+      trimmed == "" ->
+        false
+
+      String.contains?(trimmed, ["\n", "\r", ";", "&&", "||", "|", ">", "<", "`", "$("]) ->
+        false
+
+      true ->
+        case OptionParser.split(trimmed) do
+          [tool | args] -> read_only_command?(tool, args)
+          _ -> false
+        end
+    end
+  rescue
+    _ -> false
+  end
+
+  defp planning_safe_command?(_command), do: false
+
+  defp read_only_command?(tool, _args)
+       when tool in ~w(rg grep cat sed ls find fd pwd head tail wc stat tree nl jq which printenv env basename dirname realpath sort uniq cut awk) do
+    true
+  end
+
+  defp read_only_command?("git", [subcommand | _rest])
+       when subcommand in ~w(status diff show log branch rev-parse ls-files merge-base remote) do
+    true
+  end
+
+  defp read_only_command?("gh", ["pr", subcommand | _rest]) when subcommand in ~w(view list), do: true
+  defp read_only_command?("gh", ["repo", "view" | _rest]), do: true
+  defp read_only_command?(_tool, _args), do: false
 
   defp normalize_dynamic_tool_result(%{"success" => success} = result) when is_boolean(success) do
     output =
@@ -1065,6 +1225,21 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp default_on_message(_message), do: :ok
+
+  defp extract_command(payload) do
+    map_path(payload, ["params", "command"]) || map_path(payload, [:params, :command])
+  end
+
+  defp map_path(nil, _keys), do: nil
+  defp map_path(value, []), do: value
+
+  defp map_path(data, [key | rest]) when is_map(data) do
+    data
+    |> Map.get(key)
+    |> map_path(rest)
+  end
+
+  defp map_path(_data, _keys), do: nil
 
   defp tool_call_name(params) when is_map(params) do
     case Map.get(params, "tool") || Map.get(params, :tool) || Map.get(params, "name") || Map.get(params, :name) do

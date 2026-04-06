@@ -65,7 +65,7 @@ Current behavior:
 
 1. Symphony picks up the Linear issue.
 2. Symphony core runs a serialized pre-run sync of the checked-out integration branch in the issue workspace before the first Codex turn when the workspace is still on `dev`/`main`/`master`.
-3. The issue moves to `Plan Progress`.
+3. If the issue is in `Todo`, Symphony immediately advances it to the next configured active state. On this machine that next state is `Plan Progress`.
 4. Codex writes the plan into the Linear workpad.
 5. The issue moves to `Plan Review` and pauses.
 6. A human reviews or edits the plan.
@@ -254,7 +254,7 @@ More detailed local design docs created during this customization work live unde
 The resulting end-to-end flow on this machine is:
 
 1. Linear issue is assigned to you.
-2. Symphony picks it up from the bound project and moves it to `Plan Progress`.
+2. Symphony picks it up from the bound project and moves it to `Plan Progress`, even when the issue already has an attached PR.
 3. Codex writes a plan into the Linear workpad.
 4. The issue moves to `Plan Review`.
 5. Human reviews the plan and moves the issue to `Code Progress`.

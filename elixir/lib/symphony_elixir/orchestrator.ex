@@ -10,7 +10,6 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
-  @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
@@ -132,16 +131,7 @@ defmodule SymphonyElixir.Orchestrator do
         state =
           case reason do
             :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
-
-              state
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
+              handle_normal_worker_exit(state, issue_id, running_entry, session_id)
 
             _ ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
@@ -657,6 +647,105 @@ defmodule SymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
+  defp handle_normal_worker_exit(%State{} = state, issue_id, running_entry, session_id) do
+    issue = refresh_issue_for_completion(Map.get(running_entry, :issue))
+    issue_state = issue_state_name(issue)
+
+    cond do
+      planning_issue_state?(issue_state) ->
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; leaving issue idle in planning state #{inspect(issue_state)} until a future explicit rerun")
+
+        complete_issue(state, issue_id)
+
+      active_issue_state?(issue_state, active_state_set()) ->
+        schedule_normal_exit_continuation_retry(state, issue_id, running_entry, issue, session_id)
+
+      true ->
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; leaving issue idle until a future explicit rerun")
+
+        complete_issue(state, issue_id)
+    end
+  end
+
+  defp refresh_issue_for_completion(%Issue{id: issue_id} = fallback_issue) when is_binary(issue_id) do
+    case Tracker.fetch_issue_states_by_ids([issue_id]) do
+      {:ok, [%Issue{} = refreshed_issue | _]} -> refreshed_issue
+      _ -> fallback_issue
+    end
+  end
+
+  defp refresh_issue_for_completion(issue), do: issue
+
+  defp schedule_normal_exit_continuation_retry(%State{} = state, issue_id, running_entry, issue, session_id) do
+    next_attempt = next_retry_attempt_from_running(running_entry)
+    workspace_path = Map.get(running_entry, :workspace_path)
+    worker_host = Map.get(running_entry, :worker_host)
+    issue_identifier = issue_identifier_for_retry(issue, running_entry, issue_id)
+    dirty? = workspace_dirty_after_normal_exit?(workspace_path, worker_host)
+
+    error =
+      if dirty? do
+        "agent exited normally while issue remained active and workspace still had local changes"
+      else
+        "agent exited normally while issue remained active without reaching a handoff state"
+      end
+
+    Logger.warning(
+      "Agent task completed for issue_id=#{issue_id} issue_identifier=#{issue_identifier} session_id=#{session_id}, but issue state=#{inspect(issue_state_name(issue))} remains active#{if dirty?, do: " with dirty workspace", else: ""}; scheduling continuation retry"
+    )
+
+    schedule_issue_retry(state, issue_id, next_attempt, %{
+      identifier: issue_identifier,
+      error: error,
+      worker_host: worker_host,
+      workspace_path: workspace_path
+    })
+  end
+
+  defp workspace_dirty_after_normal_exit?(workspace_path, worker_host)
+       when is_binary(workspace_path) do
+    case Workspace.worktree_dirty?(workspace_path, worker_host) do
+      {:ok, dirty?} -> dirty?
+      {:error, _reason} -> false
+    end
+  end
+
+  defp workspace_dirty_after_normal_exit?(_workspace_path, _worker_host), do: false
+
+  defp issue_identifier_for_retry(%Issue{identifier: identifier}, _running_entry, _issue_id)
+       when is_binary(identifier) and identifier != "" do
+    identifier
+  end
+
+  defp issue_identifier_for_retry(_issue, running_entry, issue_id) do
+    Map.get(running_entry, :identifier) || issue_id
+  end
+
+  defp planning_issue_state?(state_name) when is_binary(state_name) do
+    case next_state_after_todo() do
+      nil -> false
+      planning_state -> normalize_issue_state(planning_state) == normalize_issue_state(state_name)
+    end
+  end
+
+  defp planning_issue_state?(_state_name), do: false
+
+  defp next_state_after_todo do
+    Config.settings!().tracker.active_states
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> do_next_state_after_todo()
+  end
+
+  defp do_next_state_after_todo(["Todo", next_state | _rest]), do: next_state
+  defp do_next_state_after_todo([_state | rest]), do: do_next_state_after_todo(rest)
+  defp do_next_state_after_todo([]), do: nil
+
+  defp issue_state_name(%Issue{state: state_name}) when is_binary(state_name), do: state_name
+  defp issue_state_name(%{state: state_name}) when is_binary(state_name), do: state_name
+  defp issue_state_name(%{"state" => state_name}) when is_binary(state_name), do: state_name
+  defp issue_state_name(_issue), do: nil
+
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
@@ -926,11 +1015,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
-    else
-      failure_retry_delay(attempt)
-    end
+    failure_retry_delay(attempt)
   end
 
   defp failure_retry_delay(attempt) do
